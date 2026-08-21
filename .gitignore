@@ -1,0 +1,36 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+credentials.json
+token.json
+data/token.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# Runtime state
+runtime/
+logs/
+
+# Generated audio
+assets/runtime_audio/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Generated analysis artifacts
+repomix-output.xml

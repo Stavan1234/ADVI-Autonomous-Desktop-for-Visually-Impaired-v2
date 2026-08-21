@@ -1,0 +1,15 @@
+# Runtime dependencies retained from the previous Shadow project.
+# requests is explicitly included because the old Gemini service imported it
+# without declaring it in requirements.txt.
+groq>=1.0.0
+python-dotenv>=1.0.0
+requests>=2.32.0
+google-auth-oauthlib>=1.2.0
+google-api-python-client>=2.100.0
+dnspython>=2.6.0
+sounddevice>=0.4.0
+soundfile>=0.12.0
+watchdog>=4.0.0
+pypdf>=6.0.0
+python-docx>=1.2.0
+pywinauto>=0.6.8

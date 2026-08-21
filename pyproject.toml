@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "advi-desktop-agent"
+version = "0.1.0"
+description = "ADVI — Autonomous Desktop for Visually Impaired"
+requires-python = ">=3.13,<3.14"
+readme = "README.md"
+dependencies = [
+    "groq>=1.0.0",
+    "python-dotenv>=1.0.0",
+    "requests>=2.32.0",
+    "google-auth-oauthlib>=1.2.0",
+    "google-api-python-client>=2.100.0",
+    "dnspython>=2.6.0",
+    "sounddevice>=0.4.0",
+    "soundfile>=0.12.0",
+    "watchdog>=4.0.0",
+    "pypdf>=6.0.0",
+    "python-docx>=1.2.0",
+    "pywinauto>=0.6.8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+advi = "advi.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+addopts = "-q"
