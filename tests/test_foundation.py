@@ -2,6 +2,24 @@ from advi.core.config import load_settings
 from advi.core.runtime import Runtime
 from advi.io.tts import clean_for_speech
 from advi.io.output import AdviResponse, OutputManager
+from advi.providers import LLMProvider, LLMResponse
+from unittest.mock import Mock, patch
+from advi.core.conversation import ConversationEngine
+
+from groq import (
+    APIConnectionError,
+    APITimeoutError,
+    AuthenticationError,
+    RateLimitError,
+)
+
+from advi.providers import (
+    GroqProvider,
+    LLMAuthenticationError,
+    LLMRateLimitError,
+    LLMTimeoutError,
+    LLMUnavailableError,
+)
 
 def test_response_has_separate_speech_representation():
     response = AdviResponse(
@@ -125,3 +143,214 @@ def test_output_manager_reports_success():
 
     assert result is True
     assert fake_tts.spoken == ["Hello. This is a test."]
+
+
+
+def test_llm_response_contract():
+    response = LLMResponse(
+        text="Hello.",
+        provider="test",
+        model="test-model",
+        input_tokens=10,
+        output_tokens=5,
+        latency_ms=42.5,
+        finish_reason="stop",
+        request_id="test-request",
+    )
+
+    assert response.text == "Hello."
+    assert response.provider == "test"
+    assert response.model == "test-model"
+    assert response.input_tokens == 10
+    assert response.output_tokens == 5
+    assert response.latency_ms == 42.5
+    assert response.finish_reason == "stop"
+    assert response.request_id == "test-request"
+
+def test_llm_provider_is_abstract():
+    assert issubclass(LLMProvider, object)
+
+
+def test_groq_provider_properties():
+    provider = GroqProvider(
+        api_key="test-key",
+        model="test-model",
+    )
+
+    assert provider.name == "groq"
+    assert provider.model == "test-model"
+
+
+def test_groq_authentication_error_is_normalized():
+    provider = GroqProvider(
+        api_key="test-key",
+        model="test-model",
+    )
+
+    with patch.object(
+        provider._client.chat.completions,
+        "create",
+        side_effect=AuthenticationError(
+            "bad key",
+            response=Mock(status_code=401),
+            body=None,
+        ),
+    ):
+        try:
+            provider.chat(
+                [{"role": "user", "content": "hello"}]
+            )
+            assert False
+        except LLMAuthenticationError as exc:
+            assert "authentication" in str(exc).lower()
+
+
+def test_groq_rate_limit_error_is_normalized():
+    provider = GroqProvider(
+        api_key="test-key",
+        model="test-model",
+    )
+
+    with patch.object(
+        provider._client.chat.completions,
+        "create",
+        side_effect=RateLimitError(
+            "rate limited",
+            response=Mock(status_code=429),
+            body=None,
+        ),
+    ):
+        try:
+            provider.chat(
+                [{"role": "user", "content": "hello"}]
+            )
+            assert False
+        except LLMRateLimitError as exc:
+            assert "rate limit" in str(exc).lower()
+
+
+def test_groq_timeout_error_is_normalized():
+    provider = GroqProvider(
+        api_key="test-key",
+        model="test-model",
+    )
+
+    with patch.object(
+        provider._client.chat.completions,
+        "create",
+        side_effect=APITimeoutError(
+            request=Mock(),
+        ),
+    ):
+        try:
+            provider.chat(
+                [{"role": "user", "content": "hello"}]
+            )
+            assert False
+        except LLMTimeoutError as exc:
+            assert "timed out" in str(exc).lower()
+
+
+def test_groq_connection_error_is_normalized():
+    provider = GroqProvider(
+        api_key="test-key",
+        model="test-model",
+    )
+
+    with patch.object(
+        provider._client.chat.completions,
+        "create",
+        side_effect=APIConnectionError(
+            request=Mock(),
+        ),
+    ):
+        try:
+            provider.chat(
+                [{"role": "user", "content": "hello"}]
+            )
+            assert False
+        except LLMUnavailableError as exc:
+            assert "connect" in str(exc).lower()
+
+
+def test_groq_success_is_normalized():
+    provider = GroqProvider(
+        api_key="test-key",
+        model="test-model",
+    )
+
+    mock_response = Mock()
+
+    mock_response.choices = [
+        Mock(
+            message=Mock(content="Hello, Advi."),
+            finish_reason="stop",
+        )
+    ]
+
+    mock_response.usage = Mock(
+        prompt_tokens=12,
+        completion_tokens=7,
+    )
+
+    mock_response.id = "req-test-123"
+
+    with patch.object(
+        provider._client.chat.completions,
+        "create",
+        return_value=mock_response,
+    ):
+        response = provider.chat(
+            [{"role": "user", "content": "hello"}]
+        )
+
+    assert response.text == "Hello, Advi."
+    assert response.provider == "groq"
+    assert response.model == "test-model"
+    assert response.input_tokens == 12
+    assert response.output_tokens == 7
+    assert response.finish_reason == "stop"
+    assert response.request_id == "req-test-123"
+    assert response.latency_ms is not None            
+
+
+class FakeProvider:
+    name = "fake"
+    model = "fake-model"
+
+    def __init__(self) -> None:
+        self.messages: list[dict[str, str]] = []
+
+    def chat(self, messages):
+        self.messages = messages
+
+        return LLMResponse(
+            text="Hello from the fake model.",
+            provider=self.name,
+            model=self.model,
+        )
+
+
+def test_conversation_engine_creates_response():
+    provider = FakeProvider()
+    engine = ConversationEngine(provider)
+
+    response = engine.respond("Hello Advi.")
+
+    assert response.text == "Hello from the fake model."
+    assert provider.messages == [
+        {
+            "role": "user",
+            "content": "Hello Advi.",
+        }
+    ]
+
+
+def test_conversation_engine_ignores_empty_input():
+    provider = FakeProvider()
+    engine = ConversationEngine(provider)
+
+    response = engine.respond("   ")
+
+    assert response.text == ""
+    assert provider.messages == []
