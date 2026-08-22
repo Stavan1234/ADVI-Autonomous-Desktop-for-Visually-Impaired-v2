@@ -1,3 +1,4 @@
+from _pytest import cacheprovider
 from advi.core.config import load_settings
 from advi.core.runtime import Runtime
 from advi.io.tts import clean_for_speech
@@ -342,12 +343,14 @@ def test_conversation_engine_creates_response():
     response = engine.respond("Hello Advi.")
 
     assert response.text == "Hello from the fake model."
-    assert provider.messages == [
-        {
-            "role": "user",
-            "content": "Hello Advi.",
-        }
-    ]
+    assert provider.messages[-1] == {
+        "role": "user",
+        "content": "Hello Advi.",
+    }
+
+    assert provider.messages[0]["role"] == "system"
+    assert "You are ADVI" in provider.messages[0]["content"]
+    assert "Be concise by default" in provider.messages[0]["content"]
 
 
 def test_conversation_engine_ignores_empty_input():
@@ -898,4 +901,140 @@ def test_memory_conflict_equal_confidence_replaces_old(
     )
 
     assert len(history) == 1
-    assert history[0].value == "Old College"                
+    assert history[0].value == "Old College"       
+
+
+def test_advi_identity_is_present():
+    from advi.core.personality import build_advi_system_prompt
+
+    prompt = build_advi_system_prompt()
+
+    assert "ADVI" in prompt
+    assert "Autonomous Desktop for the Visually Impaired" in prompt
+    assert "Do not identify yourself as ChatGPT" in prompt
+
+
+def test_advi_personality_is_concise_by_default():
+    from advi.core.personality import build_advi_system_prompt
+
+    prompt = build_advi_system_prompt()
+
+    assert "Be concise by default" in prompt
+    assert "Do not over-explain" in prompt
+
+
+def test_advi_personality_is_speech_friendly():
+    from advi.core.personality import build_advi_system_prompt
+
+    prompt = build_advi_system_prompt()
+
+    assert "speech-friendly" in prompt
+    assert "Do not read Markdown syntax literally" in prompt             
+
+def test_response_policy_defaults_to_concise():
+    from advi.core.response_policy import detect_response_mode
+
+    assert detect_response_mode("What is Python?") == "concise"
+
+
+def test_response_policy_detects_detailed_request():
+    from advi.core.response_policy import detect_response_mode
+
+    assert detect_response_mode(
+        "Explain Python in detail."
+    ) == "detailed"
+
+
+def test_response_policy_detects_brief_request():
+    from advi.core.response_policy import detect_response_mode
+
+    assert detect_response_mode(
+        "What is Python? Keep it short."
+    ) == "concise"
+
+
+def test_response_policy_builds_instruction():
+    from advi.core.response_policy import build_response_policy
+
+    policy = build_response_policy("Explain this step by step.")
+
+    assert "DETAILED" in policy
+
+def test_capability_registry_contains_core_capabilities():
+    from advi.core.capabilities import (
+        CAPABILITIES,
+        CapabilityStatus,
+    )
+
+    assert "conversation" in CAPABILITIES
+    assert "memory" in CAPABILITIES
+    assert "session_continuity" in CAPABILITIES
+    assert "speech_output" in CAPABILITIES
+
+    assert (
+        CAPABILITIES["memory"].status
+        == CapabilityStatus.AVAILABLE
+    )
+
+
+def test_capability_registry_marks_unimplemented_features_unavailable():
+    from advi.core.capabilities import (
+        CAPABILITIES,
+        CapabilityStatus,
+    )
+
+    assert (
+        CAPABILITIES["web_search"].status
+        == CapabilityStatus.UNAVAILABLE
+    )
+
+    assert (
+        CAPABILITIES["vision"].status
+        == CapabilityStatus.UNAVAILABLE
+    )
+
+    assert (
+        CAPABILITIES["desktop_control"].status
+        == CapabilityStatus.UNAVAILABLE
+    )
+
+
+def test_get_capability_is_case_insensitive():
+    from advi.core.capabilities import get_capability
+
+    capability = get_capability(" MEMORY ")
+
+    assert capability is not None
+    assert capability.name == "memory"
+
+
+def test_capability_summary_contains_status_groups():
+    from advi.core.capabilities import capability_summary
+
+    summary = capability_summary()
+
+    assert "Available capabilities:" in summary
+    assert "Unavailable capabilities:" in summary
+    assert "memory:" in summary
+    assert "web_search:" in summary
+
+
+def test_capability_can_use_reports_actual_status():
+    from advi.core.capabilities import can_use
+
+    assert can_use("conversation")
+    assert can_use("memory")
+    assert not can_use("web_search")
+    assert not can_use("vision")
+
+
+def test_capability_prompt_contains_available_and_unavailable_state():
+    from advi.core.capabilities import capability_for_prompt
+
+    prompt = capability_for_prompt()
+
+    assert "Conversation: available" in prompt
+    assert "Long-term memory: available" in prompt
+    assert "Web search: unavailable" in prompt
+    assert "Screen/vision understanding: unavailable" in prompt
+    assert "Never claim to have an unavailable capability." in prompt            

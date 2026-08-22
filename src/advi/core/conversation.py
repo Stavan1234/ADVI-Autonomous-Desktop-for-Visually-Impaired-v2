@@ -7,6 +7,9 @@ from ..memory.retriever import MemoryRetriever
 from ..memory.session import SessionBuffer
 from ..memory.short_term import ShortTermMemory
 from ..providers import LLMProvider
+from .personality import build_advi_system_prompt
+from .response_policy import build_response_policy
+from .capabilities import capability_for_prompt
 
 
 @dataclass
@@ -41,6 +44,10 @@ class ConversationEngine:
         request_messages = list(messages)
 
         system_parts: list[str] = []
+
+        system_parts.append(
+            capability_for_prompt()
+        )
 
         # ---------------------------------------------------------
         # 1. Normal long-term memory retrieval
@@ -100,30 +107,27 @@ class ConversationEngine:
         # ---------------------------------------------------------
         # 4. Build system context
         # ---------------------------------------------------------
+        system_content = build_advi_system_prompt()
+
+        system_content += (
+            "\n\n"
+            + build_response_policy(text)
+        )
+
         if system_parts:
-            request_messages.insert(
-                0,
-                {
-                    "role": "system",
-                    "content": (
-                        "You are ADVI, an Autonomous Desktop "
-                        "for the Visually Impaired.\n\n"
-                        "Answer clearly, naturally, and "
-                        "appropriately for speech.\n\n"
-                        "You have been given memory and "
-                        "relationship context from previous "
-                        "interactions.\n\n"
-                        "Use the context when it is relevant "
-                        "to the user's current question.\n"
-                        "Ignore unrelated context.\n"
-                        "Do not mention the memory system.\n"
-                        "Do not claim you do not know something "
-                        "when the supplied context contains "
-                        "the answer.\n\n"
-                        + "\n\n".join(system_parts)
-                    ),
-                },
+            system_content += (
+                "\n\nContext available for this request:\n"
+                + "\n\n".join(system_parts)
+                + "\n\nUse this context only when relevant."
             )
+
+        request_messages.insert(
+            0,
+            {
+                "role": "system",
+                "content": system_content,
+            },
+        )
 
         # ---------------------------------------------------------
         # 5. Main LLM call
