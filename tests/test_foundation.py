@@ -5,6 +5,10 @@ from advi.io.output import AdviResponse, OutputManager
 from advi.providers import LLMProvider, LLMResponse
 from unittest.mock import Mock, patch
 from advi.core.conversation import ConversationEngine
+from advi.memory.long_term import LongTermMemory
+from advi.memory.short_term import ShortTermMemory
+from advi.memory.session import SessionBuffer
+from advi.memory.retriever import MemoryRetriever
 
 from groq import (
     APIConnectionError,
@@ -354,3 +358,544 @@ def test_conversation_engine_ignores_empty_input():
 
     assert response.text == ""
     assert provider.messages == []
+
+def test_long_term_memory_persists(tmp_path):
+    database = tmp_path / "memory.db"
+
+    memory = LongTermMemory(database)
+
+    memory.remember(
+        "user",
+        "name",
+        "Stavan",
+    )
+
+    # Simulate ADVI shutting down.
+    memory = LongTermMemory(database)
+
+    result = memory.recall(
+        "user",
+        "name",
+    )
+
+    assert result is not None
+    assert result.value == "Stavan"    
+
+
+def test_long_term_memory_updates_existing_value(tmp_path):
+    database = tmp_path / "memory.db"
+
+    memory = LongTermMemory(database)
+
+    memory.remember(
+        "user",
+        "name",
+        "Stavan",
+    )
+
+    memory.remember(
+        "user",
+        "name",
+        "Stavan Kalkumbe",
+    )
+
+    result = memory.recall(
+        "user",
+        "name",
+    )
+
+    assert result is not None
+    assert result.value == "Stavan Kalkumbe"
+
+def test_session_buffer_stages_evicted_messages():
+    memory = ShortTermMemory(max_messages=2)
+    buffer = SessionBuffer()
+
+    buffer.add(
+        memory.add("user", "one")
+    )
+
+    buffer.add(
+        memory.add("assistant", "two")
+    )
+
+    evicted = memory.add("user", "three")
+    buffer.add(evicted)
+
+    assert memory.get_messages() == [
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+    ]
+
+    assert buffer.messages == [
+        {"role": "user", "content": "one"},
+    ]   
+    
+def test_memory_search_handles_possessive_query(tmp_path):
+    memory = LongTermMemory(
+        tmp_path / "memory.db"
+    )
+
+    memory.remember(
+        "family",
+        "father",
+        "Devdan Kalkumbe",
+        "The user's father is Devdan Kalkumbe.",
+        0.98,
+    )
+
+    results = memory.search(
+        "What is my father's name?"
+    )
+
+    assert any(
+        item.key == "father"
+        and item.value == "Devdan Kalkumbe"
+        for item in results
+    )     
+
+def test_memory_search_handles_question_punctuation(tmp_path):
+    memory = LongTermMemory(
+        tmp_path / "memory.db"
+    )
+
+    memory.remember(
+        "family",
+        "father",
+        "Devdan Kalkumbe",
+        "The user's father is Devdan Kalkumbe.",
+        0.98,
+    )
+
+    results = memory.search(
+        "father?"
+    )
+
+    assert any(
+        item.key == "father"
+        for item in results
+    )
+
+def test_memory_update_preserves_history(tmp_path):
+    memory = LongTermMemory(
+        tmp_path / "memory.db"
+    )
+
+    memory.remember(
+        "user",
+        "institution",
+        "FCRIT Vashi",
+        "The user studies at FCRIT Vashi.",
+        0.98,
+    )
+
+    memory.remember(
+        "user",
+        "institution",
+        "VJTI",
+        "The user studies at VJTI.",
+        0.98,
+    )
+
+    current = memory.recall(
+        "user",
+        "institution",
+    )
+
+    assert current is not None
+    assert current.value == "VJTI"
+
+    history = memory.history(
+        "user",
+        "institution",
+    )
+
+    assert len(history) == 1
+    assert history[0].value == "FCRIT Vashi"
+
+def test_memory_update_does_not_create_history_for_same_fact(
+    tmp_path,
+):
+    memory = LongTermMemory(
+        tmp_path / "memory.db"
+    )
+
+    memory.remember(
+        "user",
+        "name",
+        "Stavan Kalkumbe",
+        "The user's name is Stavan Kalkumbe.",
+        0.98,
+    )
+
+    memory.remember(
+        "user",
+        "name",
+        "Stavan Kalkumbe",
+        "The user's name is Stavan Kalkumbe.",
+        0.98,
+    )
+
+    history = memory.history(
+        "user",
+        "name",
+    )
+
+    assert history == []       
+
+def test_memory_retriever_finds_paraphrased_fact(tmp_path):
+    memory = LongTermMemory(
+        tmp_path / "memory.db"
+    )
+
+    memory.remember(
+        "user",
+        "institution",
+        "FCRIT Vashi",
+        "The user studies at FCRIT Vashi.",
+        0.98,
+    )
+
+    retriever = MemoryRetriever(memory)
+
+    results = retriever.search(
+        "where do I study",
+        limit=5,
+    )
+
+    assert results
+
+    assert any(
+        result.memory.key == "institution"
+        and result.memory.value == "FCRIT Vashi"
+        for result in results
+    )
+
+
+def test_relationship_search_finds_direct_relationship(
+    tmp_path,
+):
+    memory = LongTermMemory(
+        tmp_path / "memory.db"
+    )
+
+    memory.remember_relationship(
+        "user",
+        "father",
+        "Devdan Kalkumbe",
+        0.98,
+    )
+
+    results = memory.search_relationships(
+        "What is my father's name?"
+    )
+
+    assert results
+    assert any(
+        relationship.object == "Devdan Kalkumbe"
+        for relationship in results
+    )
+
+
+def test_relationship_search_supports_multi_hop_candidates(
+    tmp_path,
+):
+    memory = LongTermMemory(
+        tmp_path / "memory.db"
+    )
+
+    memory.remember_relationship(
+        "user",
+        "uncle",
+        "Pradeep",
+        0.98,
+    )
+
+    memory.remember_relationship(
+        "Pradeep",
+        "daughter",
+        "Ramanika",
+        0.98,
+    )
+
+    memory.remember_relationship(
+        "Ramanika",
+        "younger sister",
+        "Aaradhana",
+        0.98,
+    )
+
+    results = memory.search_relationships(
+        "Who is Ramanika?"
+    )
+
+    objects = {
+        relationship.object
+        for relationship in results
+    }
+
+    assert "Ramanika" in objects
+
+
+def test_memory_update_keeps_current_value(
+    tmp_path,
+):
+    memory = LongTermMemory(
+        tmp_path / "memory.db"
+    )
+
+    memory.remember(
+        "user",
+        "institution",
+        "FCRIT Vashi",
+        "The user studies at FCRIT Vashi.",
+        0.90,
+    )
+
+    memory.remember(
+        "user",
+        "institution",
+        "VJTI",
+        "The user studies at VJTI.",
+        0.95,
+    )
+
+    current = memory.recall(
+        "user",
+        "institution"
+    )
+
+    assert current is not None
+    assert current.value == "VJTI"
+
+    history = memory.history(
+        "user",
+        "institution"
+    )
+
+    assert len(history) == 1
+    assert history[0].value == "FCRIT Vashi"
+
+
+def test_same_memory_does_not_create_history(
+    tmp_path,
+):
+    memory = LongTermMemory(
+        tmp_path / "memory.db"
+    )
+
+    memory.remember(
+        "user",
+        "name",
+        "Stavan Kalkumbe",
+        "The user's name is Stavan Kalkumbe.",
+        0.98,
+    )
+
+    memory.remember(
+        "user",
+        "name",
+        "Stavan Kalkumbe",
+        "The user's name is Stavan Kalkumbe.",
+        0.98,
+    )
+
+    assert memory.history(
+        "user",
+        "name"
+    ) == [] 
+
+def test_related_entities_supports_two_hop_relationships(
+    tmp_path,
+):
+    memory = LongTermMemory(
+        tmp_path / "memory.db"
+    )
+
+    memory.remember_relationship(
+        "user",
+        "uncle",
+        "Pradeep",
+        0.98,
+    )
+
+    memory.remember_relationship(
+        "Pradeep",
+        "daughter",
+        "Ramanika",
+        0.98,
+    )
+
+    results = memory.related_entities(
+        "user",
+        max_hops=2,
+    )
+
+    triples = {
+        (
+            item.subject,
+            item.relation,
+            item.object,
+        )
+        for item in results
+    }
+
+    assert (
+        ("user", "uncle", "Pradeep")
+        in triples
+    )
+
+    assert (
+        ("Pradeep", "daughter", "Ramanika")
+        in triples
+    )
+
+def test_memory_conflict_prefers_higher_confidence(
+    tmp_path,
+):
+    memory = LongTermMemory(
+        tmp_path / "memory.db"
+    )
+
+    memory.remember(
+        "user",
+        "institution",
+        "Old College",
+        "The user studies at Old College.",
+        0.95,
+    )
+
+    memory.remember(
+        "user",
+        "institution",
+        "New College",
+        "The user studies at New College.",
+        0.40,
+    )
+
+    current = memory.recall(
+        "user",
+        "institution",
+    )
+
+    assert current is not None
+    assert current.value == "Old College"
+
+    assert memory.history(
+        "user",
+        "institution",
+    ) == []
+
+def test_memory_conflict_accepts_higher_confidence_update(
+    tmp_path,
+):
+    memory = LongTermMemory(
+        tmp_path / "memory.db"
+    )
+
+    memory.remember(
+        "user",
+        "institution",
+        "Old College",
+        "The user studies at Old College.",
+        0.80,
+    )
+
+    memory.remember(
+        "user",
+        "institution",
+        "New College",
+        "The user studies at New College.",
+        0.95,
+    )
+
+    current = memory.recall(
+        "user",
+        "institution",
+    )
+
+    assert current is not None
+    assert current.value == "New College"
+
+    history = memory.history(
+        "user",
+        "institution",
+    )
+
+    assert len(history) == 1
+    assert history[0].value == "Old College"
+
+def test_identical_memory_does_not_create_history(
+    tmp_path,
+):
+    memory = LongTermMemory(
+        tmp_path / "memory.db"
+    )
+
+    memory.remember(
+        "user",
+        "name",
+        "Stavan",
+        "The user's name is Stavan.",
+        0.90,
+    )
+
+    memory.remember(
+        "user",
+        "name",
+        "Stavan",
+        "The user's name is Stavan.",
+        0.95,
+    )
+
+    current = memory.recall(
+        "user",
+        "name",
+    )
+
+    assert current is not None
+    assert current.confidence == 0.95
+
+    assert memory.history(
+        "user",
+        "name",
+    ) == []
+
+def test_memory_conflict_equal_confidence_replaces_old(
+    tmp_path,
+):
+    memory = LongTermMemory(
+        tmp_path / "memory.db"
+    )
+
+    memory.remember(
+        "user",
+        "institution",
+        "Old College",
+        "The user studies at Old College.",
+        0.90,
+    )
+
+    memory.remember(
+        "user",
+        "institution",
+        "New College",
+        "The user studies at New College.",
+        0.90,
+    )
+
+    current = memory.recall(
+        "user",
+        "institution",
+    )
+
+    assert current is not None
+    assert current.value == "New College"
+
+    history = memory.history(
+        "user",
+        "institution",
+    )
+
+    assert len(history) == 1
+    assert history[0].value == "Old College"                

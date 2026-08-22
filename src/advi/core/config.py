@@ -11,6 +11,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 ASSET_ROOT = PROJECT_ROOT / "assets"
 RUNTIME_ROOT = PROJECT_ROOT / "runtime"
 LOG_ROOT = PROJECT_ROOT / "logs"
+MEMORY_ROOT = RUNTIME_ROOT / "memory"
+MEMORY_DATABASE = MEMORY_ROOT / "advi_memory.db"
 
 load_dotenv(PROJECT_ROOT / ".env")
 
