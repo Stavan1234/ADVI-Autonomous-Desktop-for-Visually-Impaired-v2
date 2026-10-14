@@ -7,7 +7,7 @@ from advi.agent import AgentSession
 from advi.agent.contracts import TaskState
 from advi.capabilities.registry import Capability, CapabilityRegistry, CapabilityStatus
 from advi.providers.base import LLMProvider, LLMResponse, LLMToolCall
-from advi.providers.errors import LLMRateLimitError
+from advi.providers.errors import LLMRateLimitError, LLMRequestError
 from advi.tools import ToolCall, ToolGuard, ToolRegistry, ToolRunner
 from advi.tools.catalog import REQUEST_TOOLS_NAME, build_request_tools_spec, parse_requested_tools
 from advi.tools.contracts import ToolResult, ToolSpec
@@ -133,11 +133,51 @@ def test_request_tools_rejects_unknown_names_without_side_effects():
     assert session.task.context.get("loaded_tools", []) == []
 
 
-def test_plain_conversation_gets_no_meta_tool():
+def test_greetings_get_no_tools_but_other_conversation_keeps_the_escape_hatch():
+    # Log 2026-10-14 turn 7: "yes, and choose topic ..." accepted an offer to make a
+    # PDF, was sent with zero tools, and Groq rejected the model's create_file call.
     session = AgentSession.__new__(AgentSession)
     session.task = None
-    session.tools = SimpleNamespace(model_tools=lambda: [], list=lambda **_: [ToolSpec("find_file", "find", "file_management")])
-    assert session._select_model_tools("what is the capital of India") == []
+    session.tools = SimpleNamespace(model_tools=lambda: [], list=lambda **_: [ToolSpec("create_file", "c", "file_management")])
+
+    assert session._select_model_tools("good afternoon, how are you") == []
+    offered = [t["function"]["name"] for t in session._select_model_tools('yes, and choose topic "Be Brave"')]
+    assert offered == [REQUEST_TOOLS_NAME]
+
+
+def test_missing_tool_recovery_chains_across_two_missing_tools():
+    # Log 2026-10-14 turn 7 needed two recoveries in one turn; only one was allowed.
+    provider = _ScriptedProvider([
+        LLMRequestError(
+            "Tool choice is none, but model called a tool failed_generation "
+            '{"name": "create_file", "arguments": {}}'
+        ),
+        LLMRequestError("attempted to call tool 'open_file' which was not in request.tools"),
+        _text("Which topic should the speech cover?"),
+    ])
+    session, _engine = _session(provider, {"file_management": {"create_file", "open_file"}, "desktop_control": {"click"}})
+
+    response = session.respond("sure, go ahead with a speech")
+
+    assert response.text == "Which topic should the speech cover?"
+    assert "create_file" in provider.offered[1]
+    assert {"create_file", "open_file"} <= set(provider.offered[2])
+
+
+def test_undeclared_request_tools_is_declared_by_recovery():
+    session = AgentSession.__new__(AgentSession)
+    session.task = None
+    session.tools = SimpleNamespace(list=lambda **_: [ToolSpec("create_file", "c", "file_management")])
+    declared = [ToolSpec("open_file", "o", "file_management").to_openai_tool()]
+
+    augmented = session._tools_with_missing_tool(declared, REQUEST_TOOLS_NAME)
+
+    assert [t["function"]["name"] for t in augmented] == ["open_file", REQUEST_TOOLS_NAME]
+
+
+def test_request_tools_accepts_name_argument_variants():
+    assert parse_requested_tools({"name": "open_file"}) == ["open_file"]
+    assert parse_requested_tools({"names": ["open_file", "read_file"]}) == ["open_file", "read_file"]
 
 
 def test_catalog_lists_only_tools_not_already_exposed():
@@ -304,6 +344,9 @@ def test_actions_that_mention_disks_or_status_are_not_system_queries():
     assert check("copy it to disk") is None
     assert check("send an email to David with my system status") is None
     assert check("status") is None
+    # Log 2026-10-14 turn 2: the date half of this question was silently dropped.
+    assert check("what is my laptop status. and what is today's date?") is None
+    assert check("battery and storage") is None
 
 
 # --- stop and diagnosis never wait on the language provider ---

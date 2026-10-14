@@ -25,6 +25,8 @@ class BrowserCapability:
     """
 
     SUPPORTED_ACTIONS = {
+        "open_browser",
+        "play_media",
         "navigate",
         "search",
         "click_web_element",
@@ -73,6 +75,11 @@ class BrowserCapability:
 
     def close(self) -> None:
         """Stop Chrome only when this capability launched its dedicated process."""
+        if self._pw_enabled():
+            from . import pw_session
+
+            if pw_session._shared is not None:
+                pw_session._shared.close()  # closes the Playwright-launched ADVI Chrome
         pid = self.context.chrome_process_id
         self.context.chrome_process_id = None
         if not pid:
@@ -151,6 +158,14 @@ class BrowserCapability:
             )
             return False
 
+        # Launch ADVI's dedicated Chrome through Playwright (it keeps the CDP
+        # port open for the legacy helpers). Direct launch remains the fallback.
+        try:
+            self._pw_ready()
+            return True
+        except Exception as exc:
+            logger.warning("Playwright launch failed; launching Chrome directly: %s", exc)
+
         # Launch Chrome with CDP
         possible_paths = [
             Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
@@ -199,7 +214,7 @@ class BrowserCapability:
 
         return False
 
-    def _execute_navigate(self, action: ToolCall) -> ToolResult:
+    def _legacy_navigate(self, action: ToolCall) -> ToolResult:
         url = action.parameters.get("url") or action.target or ""
         if not url:
             return ToolResult(
@@ -385,7 +400,52 @@ class BrowserCapability:
             metadata={"tab_id": tab_id, "current_url": url},
         )
 
-    def _execute_search(self, action: ToolCall) -> ToolResult:
+    _YOUTUBE_MUSIC_SERVICES = {"youtube_music", "youtubemusic", "ytmusic", "music"}
+
+    def _execute_play_media(self, action: ToolCall) -> ToolResult:
+        """Search a media service and start playback as one verified operation.
+
+        The runtime log shows the model hand-driving navigate/search/inspect/
+        click/press "k" for 15-27 calls per song and still ending unverified.
+        The search URL is built directly, the existing result pickers choose the
+        result, and success requires the page's media element to be playing.
+        """
+        query = str(action.parameters.get("query") or "").strip()
+        if not query:
+            return ToolResult(call_id=action.call_id, name=action.action, success=False, error="What should I play? No search query was given.")
+        service = re.sub(r"[\s-]+", "_", str(action.parameters.get("service") or "youtube").strip().casefold())
+        music = service in self._YOUTUBE_MUSIC_SERVICES
+        if not music and service not in {"youtube", ""}:
+            return ToolResult(
+                call_id=action.call_id, name=action.action, success=False,
+                error=f"play_media supports YouTube and YouTube Music, not '{service}'.",
+            )
+        tab_id = self._owned_tab_id()
+        if not tab_id:
+            return ToolResult(call_id=action.call_id, name=action.action, success=False, error="No ADVI-owned Chrome tab is available.")
+        base = "https://music.youtube.com/search?q=" if music else "https://www.youtube.com/results?search_query="
+        url = base + urllib.parse.quote_plus(query)
+        if not self.cdp.navigate_tab(tab_id=tab_id, url=url, timeout=12.0):
+            return ToolResult(call_id=action.call_id, name=action.action, success=False, error=f"I couldn't open the search page for '{query}'.")
+        wait_dom = getattr(self.cdp, "wait_for_dom_ready", None)
+        if callable(wait_dom):
+            wait_dom(tab_id, timeout=8.0)
+        self.context.target_tab_url = url
+        if music:
+            result = self._pw_play_best_match(action, query) if self._pw_enabled() else None
+            if result is None or not result.success:
+                result = self._youtube_music_play_requested_result(action, tab_id) or result
+        else:
+            result = self._youtube_play_first_result(action, "play", tab_id)
+        if result is None:
+            return ToolResult(
+                call_id=action.call_id, name=action.action, success=False, output=query,
+                error=f"I searched for '{query}' but found nothing I could play.",
+                metadata={"tab_id": tab_id, "url": url, "service": "youtube_music" if music else "youtube"},
+            )
+        return result
+
+    def _legacy_search(self, action: ToolCall) -> ToolResult:
         """Search using the single canonical in-page CDP search implementation."""
         query = str(action.parameters.get("query") or action.parameters.get("value") or "").strip()
         if not query:
@@ -1071,7 +1131,7 @@ class BrowserCapability:
             time.sleep(0.35)
         return last or None
 
-    def _execute_click_web_element(self, action: ToolCall) -> ToolResult:
+    def _legacy_click_web_element(self, action: ToolCall) -> ToolResult:
         requested = str(action.parameters.get("selector") or action.target or "").strip()
         tab_id = self._owned_tab_id()
         if not tab_id or not requested:
@@ -1567,7 +1627,7 @@ class BrowserCapability:
         )
 
 
-    def _execute_inspect_web_page(self, action: ToolCall) -> ToolResult:
+    def _legacy_inspect_web_page(self, action: ToolCall) -> ToolResult:
         """Return a bounded, actionable inventory of visible webpage controls."""
         tab_id = self._owned_tab_id()
         if not tab_id:
@@ -1740,7 +1800,7 @@ class BrowserCapability:
             metadata={"tab_id": tab_id, "count": len(data), "cdp_port": self.cdp_port},
         )
 
-    def _execute_type_web_element(self, action: ToolCall) -> ToolResult:
+    def _legacy_type_web_element(self, action: ToolCall) -> ToolResult:
         """Type into an exact webpage control and verify its resulting value."""
         tab_id = self._owned_tab_id()
         if not tab_id:
@@ -1876,4 +1936,251 @@ class BrowserCapability:
                 "length": len(text) if isinstance(text, str) else 0,
                 "page_text_available": bool(text),
             },
+        )
+
+    # ------------------------------------------------------------------
+    # Playwright-backed paths. The legacy CDP implementations above remain as
+    # fallbacks when Playwright is unavailable or an action uses a CSS selector.
+    # ------------------------------------------------------------------
+    _REF_RE = re.compile(r"^(?:f\d+)?e\d+$")
+
+    def _pw(self):
+        from .pw_session import shared_browser
+
+        return shared_browser()
+
+    def _pw_enabled(self) -> bool:
+        # Only drive a real Chrome. An injected CDP client (tests, adapters)
+        # keeps the legacy path and must never cause a browser launch.
+        return isinstance(self.cdp, CDPBrowser)
+
+    def _pw_ready(self):
+        """The Playwright page, aligned with ADVI's owned CDP tab (one source of truth)."""
+        if not self._pw_enabled():
+            raise RuntimeError("Playwright engine disabled for a non-standard CDP client")
+        browser = self._pw()
+        page = browser.ensure_page()
+        owned = self.context.target_tab_id
+        if owned and self._target_id(page) != str(owned):
+            for candidate in (browser._context.pages if browser._context else []):
+                if not candidate.is_closed() and self._target_id(candidate) == str(owned):
+                    browser.page = page = candidate
+                    break
+        target = self._target_id(page)
+        if target:
+            self.context.set_target_tab(tab_id=target, url=page.url, title=page.title())
+        return browser, page
+
+    @staticmethod
+    def _target_id(page) -> str | None:
+        try:
+            session = page.context.new_cdp_session(page)
+            try:
+                return str(session.send("Target.getTargetInfo")["targetInfo"]["targetId"])
+            finally:
+                session.detach()
+        except Exception:
+            return None
+
+    def _pw_result(self, action: ToolCall, *, success: bool, summary: str, output: Any = None,
+                   details: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None) -> ToolResult:
+        details = dict(details or {})
+        return ToolResult(
+            call_id=action.call_id, name=action.action, success=success, output=output,
+            human_readable=summary, error=None if success else summary,
+            verified=success, verification_status="verified" if success else "failed",
+            verification_details={"engine": "playwright", **details},
+            metadata={"engine": "playwright", "tab_id": self.context.target_tab_id, "cdp_port": self.cdp_port,
+                      **dict(metadata or {}), "verification_details": details},
+        )
+
+    def _execute_open_browser(self, action: ToolCall) -> ToolResult:
+        """Open ADVI's own browser window (never the user's personal Chrome profile)."""
+        try:
+            browser, page = self._pw_ready()
+            url = str(action.parameters.get("url") or "").strip()
+            if url:
+                browser.goto(url)
+            browser.bring_to_front()
+            return self._pw_result(action, success=True, summary=f"Opened the browser{' at ' + page.url if url else ''}.",
+                                   output=page.url, details={"current_url": page.url})
+        except Exception as exc:
+            logger.warning("Playwright open_browser failed, using legacy launch: %s", exc)
+            return self._pw_result(action, success=bool(self._owned_tab_id()), summary="Opened the browser.")
+
+    def _execute_navigate(self, action: ToolCall) -> ToolResult:
+        if not self._pw_enabled():
+            return self._legacy_navigate(action)
+        url = str(action.parameters.get("url") or action.target or "").strip()
+        if not url:
+            return self._legacy_navigate(action)
+        try:
+            browser, page = self._pw_ready()
+            info = browser.goto(url)
+            self.context.target_tab_url = info["url"]
+            self.context.target_tab_title = info["title"]
+        except Exception as exc:
+            logger.warning("Playwright navigate failed, using legacy CDP: %s", exc)
+            return self._legacy_navigate(action)
+        return ToolResult(
+            call_id=action.call_id, name=action.action, success=True, output=info["url"],
+            human_readable=f"Opened {info['title'] or info['url']}.",
+            verified=True, verification_status="verified",
+            verification_details={"method": "playwright_goto", "current_url": info["url"], "status": info.get("status")},
+            metadata={"current_url": info["url"], "expected_url": url, "tab_title": info["title"],
+                      "cdp_port": self.cdp_port, "tab_id": self.context.target_tab_id, "engine": "playwright"},
+        )
+
+    def _execute_inspect_web_page(self, action: ToolCall) -> ToolResult:
+        if not self._pw_enabled():
+            return self._legacy_inspect_web_page(action)
+        try:
+            browser, _page = self._pw_ready()
+            from .pw_session import SNAPSHOT_LIMIT
+
+            limit = max(10, min(int(action.parameters.get("limit") or SNAPSHOT_LIMIT), SNAPSHOT_LIMIT))
+            snap = browser.snapshot(limit=limit)
+        except Exception as exc:
+            logger.warning("Playwright snapshot failed, using legacy inventory: %s", exc)
+            return self._legacy_inspect_web_page(action)
+        return self._pw_result(
+            action, success=True, output=snap.payload(),
+            summary=f"Page '{snap.title}' has {len(snap.elements)} interactive elements; act on them by ref.",
+            details={"method": "playwright_snapshot", "count": len(snap.elements), "snapshot": snap.number},
+        )
+
+    def _execute_click_web_element(self, action: ToolCall) -> ToolResult:
+        if not self._pw_enabled():
+            return self._legacy_click_web_element(action)
+        ref = str(action.parameters.get("selector") or action.target or "").strip()
+        if not self._REF_RE.match(ref):
+            return self._legacy_click_web_element(action)
+        try:
+            browser, page = self._pw_ready()
+            before_url = page.url
+            outcome = browser.act(ref, "click")
+            media = browser.media_state() if outcome.details else {"playing": False}
+        except Exception as exc:
+            return self._pw_result(action, success=False, summary=f"Could not click '{ref}': {exc}")
+        details = {
+            "method": "playwright_click", "before_url": before_url, "current_url": browser.page.url,
+            "state_changed": outcome.ok, "new_tab": outcome.details.get("new_tab"),
+            "playing": bool(media.get("playing")), "playback": media,
+        }
+        success = outcome.ok or bool(media.get("playing"))
+        summary = outcome.message + (" Media is playing." if media.get("playing") else "")
+        return self._pw_result(action, success=success, summary=summary, details=details,
+                               output={"result": summary, "url": browser.page.url, "snapshot": outcome.details.get("snapshot")})
+
+    def _execute_type_web_element(self, action: ToolCall) -> ToolResult:
+        if not self._pw_enabled():
+            return self._legacy_type_web_element(action)
+        ref = str(action.parameters.get("selector") or action.parameters.get("target") or "").strip()
+        if not self._REF_RE.match(ref):
+            return self._legacy_type_web_element(action)
+        text = str(action.parameters.get("text") if action.parameters.get("text") is not None else action.parameters.get("value") or "")
+        submit = str(action.parameters.get("submit") or "").strip().casefold() in {"true", "1", "yes"}
+        try:
+            browser, page = self._pw_ready()
+            filled = browser.act(ref, "fill", text)
+            after = filled.details.get("value_after")
+            submitted = browser.act(ref, "press", "Enter") if (submit and filled.ok) else None
+        except Exception as exc:
+            return self._pw_result(action, success=False, summary=f"Could not type into '{ref}': {exc}")
+        summary = filled.message + (f" Submitted; now at {browser.page.url}." if submitted is not None else "")
+        snapshot = (submitted or filled).details.get("snapshot")
+        result = self._pw_result(action, success=filled.ok, summary=summary,
+                                 output={"result": summary, "url": browser.page.url, "snapshot": snapshot},
+                                 details={"method": "playwright_fill", "submitted": submitted is not None},
+                                 metadata={"selector": ref, "before": "", "after": str(after if after is not None else text), "expected": text})
+        return result
+
+    def _execute_search(self, action: ToolCall) -> ToolResult:
+        """Search on the current site: find its search field, fill it, submit, wait for results."""
+        if not self._pw_enabled():
+            return self._legacy_search(action)
+        query = str(action.parameters.get("query") or action.parameters.get("value") or "").strip()
+        current = str(self.context.target_tab_url or "").casefold()
+        # YouTube has a dedicated, verified result pipeline in the legacy path.
+        if not query or "youtube.com" in current:
+            return self._legacy_search(action)
+        try:
+            browser, page = self._pw_ready()
+            snap = browser.snapshot()
+            fields = [e for e in snap.elements if e.get("role") in ("searchbox", "combobox", "textbox") and not e.get("disabled")]
+            fields.sort(key=lambda e: (e.get("role") != "searchbox", "search" not in e.get("name", "").casefold()))
+            if not fields:
+                return self._legacy_search(action)
+            before_url = page.url
+            ref = fields[0]["ref"]
+            filled = browser.act(ref, "fill", query)
+            submitted = browser.act(ref, "press", "Enter") if filled.ok else filled
+        except Exception as exc:
+            logger.warning("Playwright search failed, using legacy CDP: %s", exc)
+            return self._legacy_search(action)
+        changed = bool(submitted.details.get("url_changed") or submitted.details.get("page_changed"))
+        summary = (f"Searched for '{query}'; results are showing at {browser.page.url}." if changed
+                   else f"Typed '{query}' into the search field and pressed Enter, but the page did not change.")
+        return self._pw_result(
+            action, success=filled.ok and changed, summary=summary,
+            output={"result": summary, "url": browser.page.url, "snapshot": submitted.details.get("snapshot")},
+            details={"method": "playwright_site_search", "field": fields[0].get("name"), "before_url": before_url,
+                     "current_url": browser.page.url},
+            metadata={"query": query},
+        )
+
+    def _pw_play_best_match(self, action: ToolCall, query: str) -> ToolResult | None:
+        """On a results page, click the play control that best matches the query; require real playback.
+
+        Titles rarely match a spoken query exactly ("Overflow (Live) - Transformation
+        Worship" for "Overflow Transformation Worship"), so candidates are scored by
+        the share of query words they contain.
+        """
+        words = [w for w in re.findall(r"\w+", query.casefold()) if len(w) > 1]
+        if not words:
+            return None
+        try:
+            browser, _page = self._pw_ready()
+            browser.wait_dom_stable(timeout=4.0)
+            snap = browser.snapshot()
+        except Exception as exc:
+            logger.warning("Playwright play lookup failed: %s", exc)
+            return None
+
+        def score(element: dict[str, Any]) -> float:
+            name = str(element.get("name") or "").casefold()
+            covered = sum(1 for word in words if word in name) / len(words)
+            is_play = name.startswith("play ") or "watch?v=" in str(element.get("href") or "")
+            return covered + (0.25 if is_play else 0.0)
+
+        candidates = [e for e in snap.elements if e.get("role") in ("button", "link") and not e.get("disabled")]
+        candidates.sort(key=score, reverse=True)
+        if not candidates or score(candidates[0]) < 0.75:
+            return None
+        best = candidates[0]
+        outcome = browser.act(best["ref"], "click")
+        media: dict[str, Any] = {"playing": False}
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            media = browser.media_state()
+            if media.get("playing"):
+                break
+            time.sleep(0.5)
+        if not media.get("playing"):
+            # Some players open paused; press their own Play control once.
+            try:
+                snap = browser.snapshot()
+                player_play = next((e for e in snap.elements if e.get("role") == "button" and str(e.get("name")).strip().casefold() == "play"), None)
+                if player_play is not None:
+                    browser.act(player_play["ref"], "click")
+                    time.sleep(1.5)
+                    media = browser.media_state()
+            except Exception:
+                pass
+        playing = bool(media.get("playing"))
+        summary = f"Playing '{best.get('name')}'." if playing else f"I clicked '{best.get('name')}' but playback did not start."
+        return self._pw_result(
+            action, success=playing, summary=summary, output=query,
+            details={"method": "playwright_best_match_play", "selected": best.get("name"), "playing": playing,
+                     "playback": media, "click": outcome.message},
         )

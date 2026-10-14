@@ -807,16 +807,42 @@ class DesktopCapability:
                 verified=False, verification_status="uncertain", verification_details=detail, metadata=detail,
             )
 
+        # The runtime log shows set_edit_text "succeeding" while Notepad saved
+        # under its default name in another folder. Read the field back, fall
+        # back to typing, and never press Save with an unconfirmed filename.
+        def filename_matches() -> bool:
+            current = self._dialog_edit_value(filename_control)
+            return current is not None and current.strip().casefold() == str(target_path).casefold()
+
         try:
             filename_control.set_edit_text(str(target_path))
         except Exception:
+            pass
+        if not filename_matches():
             try:
+                from pywinauto import keyboard as _keyboard
+
                 filename_control.click_input()
                 pyautogui.hotkey("ctrl", "a")
-                pyautogui.write(str(target_path))
-            except Exception as exc:
-                detail = {"path": str(target_path), "dialog_hwnd": dialog_hwnd, "reason": f"filename_control_write_failed: {exc}"}
-                return ToolResult(call_id=action.call_id, name=action.action, success=False, error="Could not enter the Save As destination.", metadata=detail, verification_details=detail)
+                escaped = "".join("{%s}" % ch if ch in "{}+^%~()" else ch for ch in str(target_path))
+                _keyboard.send_keys(escaped, with_spaces=True, pause=0.01)
+                time.sleep(0.2)
+            except Exception:
+                pass
+        if not filename_matches():
+            try:
+                pyautogui.press("esc")
+            except Exception:
+                pass
+            detail = {
+                "path": str(target_path), "dialog_hwnd": dialog_hwnd,
+                "reason": "filename_not_confirmed", "field_value": self._dialog_edit_value(filename_control),
+            }
+            return ToolResult(
+                call_id=action.call_id, name=action.action, success=False,
+                error="I couldn't confirm the file name in the Save As dialog, so I cancelled it instead of saving under the wrong name.",
+                verified=False, verification_status="failed", metadata=detail, verification_details=detail,
+            )
 
         try:
             save_button.click_input()
@@ -846,9 +872,21 @@ class DesktopCapability:
             "path": str(target_path), "dialog_hwnd": dialog_hwnd, "file_exists": exists,
             "window_title": title, "dirty": dirty, "method": "windows_save_as_dialog"
         }
+        saved_elsewhere = None
+        if not exists and dirty is False and title:
+            # The app saved, just not where asked; its title names the real file.
+            saved_elsewhere = re.split(r"\s+-\s+", title.lstrip("*"), maxsplit=1)[0].strip() or None
+            detail["saved_under_name"] = saved_elsewhere
+        if verified:
+            message = f"Saved the current document as '{target_path.name}'."
+        elif saved_elsewhere:
+            message = (f"The app saved the document as '{saved_elsewhere}' instead of '{target_path.name}', "
+                       "probably in its last-used folder.")
+        else:
+            message = f"Save As was requested for '{target_path.name}', but the saved state could not be verified."
         return ToolResult(
             call_id=action.call_id, name=action.action, success=verified, output=str(target_path),
-            human_readable=(f"Saved the current document as '{target_path.name}'." if verified else f"Save As was requested for '{target_path.name}', but the saved state could not be verified."),
+            human_readable=message,
             verified=verified, verification_status="verified" if verified else "uncertain",
             verification_details=detail, metadata={**detail, "resolved_path": str(target_path)},
         )
@@ -869,6 +907,18 @@ class DesktopCapability:
         if base is not None:
             return base / Path(*parts[1:])
         return env.desktop / path
+
+    @staticmethod
+    def _dialog_edit_value(control: Any) -> str | None:
+        """Read back a dialog edit field (ValuePattern first, then window text)."""
+        for reader in ("get_value", "window_text"):
+            try:
+                value = getattr(control, reader)()
+            except Exception:
+                continue
+            if value is not None:
+                return str(value)
+        return None
 
     @staticmethod
     def _get_uia_window(hwnd: int) -> Any | None:

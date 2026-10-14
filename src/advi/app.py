@@ -175,6 +175,7 @@ def main() -> None:
             session_buffer=SessionBuffer(),
             runtime=runtime,
         )
+        agent.progress_callback = output.narrate
 
         # Everything expensive and deterministic happens BEFORE interactive chat:
         # provider session construction, semantic model load, saved Gmail token

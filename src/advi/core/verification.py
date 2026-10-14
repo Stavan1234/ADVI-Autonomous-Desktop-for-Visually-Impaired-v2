@@ -88,7 +88,9 @@ class ToolVerifier:
                 verification_status=(
                     VerificationStatus.VERIFIED if result.verified else VerificationStatus.UNCERTAIN
                 ),
-                verification_details={"method": "no_verifier"},
+                # Keep the handler's own evidence (e.g. app skills verify each
+                # step themselves); only fill in the method when it gave none.
+                verification_details={"method": "no_verifier", **dict(result.verification_details or {})},
                 evidence=result.evidence,
                 metadata=result.metadata,
                 requires_confirmation=result.requires_confirmation,
@@ -224,7 +226,12 @@ class ToolVerifier:
                             actual_content = "\n".join(str(page.get_text("text") or "") for page in document)
                             structure_ok = len(document) > 0
                             if expected_pages not in (None, ""):
-                                structure_ok = structure_ok and len(document) == max(1, int(expected_pages))
+                                # The renderer shrinks text to fit the requested
+                                # page count and only overflows when the content
+                                # cannot fit. Extra pages preserve the user's text;
+                                # rejecting them sent the model into retries that
+                                # ended in placeholder content.
+                                structure_ok = structure_ok and len(document) >= max(1, int(expected_pages))
 
                             # A binary PDF existing on disk is not enough when the
                             # user asked for a designed document. Perform a cheap
@@ -578,6 +585,8 @@ class ToolVerifier:
 
     def _verify_inspect_web_page(self, action: ToolCall, result: ToolResult) -> tuple[bool, dict[str, Any]]:
         data = result.data
+        if isinstance(data, dict) and isinstance(data.get("elements"), list):
+            data = data["elements"]  # Playwright snapshot payload
         valid = isinstance(data, list)
         return valid, {
             "method": "dom_interactive_inventory",
@@ -977,12 +986,23 @@ class ToolVerifier:
             # Gmail commonly rewrites /mail/?view=cm to /mail/u/0/?tf=cm and
             # normalizes URL encoding/empty parameters; that is a successful
             # navigation, not a verification failure.
-            expected_parts = urllib.parse.urlsplit(expected)
+            expected_parts = urllib.parse.urlsplit(expected if "://" in expected else f"https://{expected}")
             actual_parts = urllib.parse.urlsplit(actual)
-            if (
-                expected_parts.scheme == actual_parts.scheme
-                and expected_parts.netloc == actual_parts.netloc
-            ):
+
+            def site(netloc: str) -> str:
+                return netloc.split(":")[0].removeprefix("www.")
+
+            expected_site, actual_site = site(expected_parts.netloc), site(actual_parts.netloc)
+            # "miruro.to" -> "https://www.miruro.to/" is the same site; the log
+            # recorded that redirect as a definitive navigation failure twice.
+            same_site = bool(expected_site) and (
+                expected_site == actual_site
+                or actual_site.endswith("." + expected_site)
+                or expected_site.endswith("." + actual_site)
+            )
+            if same_site and expected_parts.path.strip("/") == "" and not expected_parts.query:
+                matched = True
+            elif same_site:
                 expected_path = expected_parts.path.rstrip("/")
                 actual_path = actual_parts.path.rstrip("/")
                 if expected_parts.netloc == "mail.google.com" and expected_path.startswith("/mail") and actual_path.startswith("/mail"):
@@ -1007,12 +1027,15 @@ class ToolVerifier:
                         and expected_parts.query == actual_parts.query
                     )
 
+        # A page from another site (e.g. a domain move) is uncertain, not failed;
+        # only a tab that never left a blank or error page proves failure.
+        never_loaded = str(current_url).lower().startswith(("about:blank", "chrome-error://", "data:"))
         return matched, {
             "expected_url": expected_url,
             "current_url": current_url,
             "tab_id": str(tab_id),
             "url_matched": matched,
-            "definitive_failure": not matched,
+            "definitive_failure": (not matched) and never_loaded,
             "source": "exact_cdp_tab",
         }
 

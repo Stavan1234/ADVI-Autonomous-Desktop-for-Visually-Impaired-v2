@@ -4,12 +4,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
 from datetime import datetime, timezone
+import logging
 import os
 
 from advi.core.action_contracts import get_action_contract
 from advi.capabilities.desktop.context import DesktopContext
 
-
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -146,11 +147,12 @@ _ACTION_SEMANTICS: dict[str, dict[str, Any]] = {
     "right_click": {"description": "Right-click the targeted desktop element.", "side_effect": "high", "verification": "target_state_or_observation"},
     "scroll": {"description": "Scroll the active desktop surface.", "side_effect": "medium", "verification": "observation"},
     "wait": {"description": "Wait for a duration or until the active application reaches a readiness or stability condition.", "side_effect": "low", "verification": "application_state_or_timing"},
-    "navigate": {"description": "Navigate the controlled browser to a URL.", "side_effect": "medium", "verification": "url"},
+    "navigate": {"description": "Open a URL in ADVI's browser and wait for the page to finish loading.", "side_effect": "medium", "verification": "url"},
+    "open_browser": {"description": "Open ADVI's own browser window (optionally at a URL). Use this, not open_application, for Chrome or 'the browser'.", "side_effect": "medium", "verification": "browser_page"},
     "search": {"description": "Search within the controlled browser context.", "side_effect": "medium", "verification": "page_state"},
-    "click_web_element": {"description": "Click a specific browser element.", "side_effect": "high", "verification": "page_state"},
-    "inspect_web_page": {"description": "Inspect the current webpage and list bounded interactive elements and their labels/selectors.", "side_effect": "low", "verification": "page_interactive_elements"},
-    "type_web_element": {"description": "Type text into a specific webpage input, textarea, or editable control, including controls inside open shadow roots.", "side_effect": "high", "verification": "input_value"},
+    "click_web_element": {"description": "Click a page element by its ref from the latest inspect_web_page (pass the ref as selector). Waits until the element can be clicked, then returns what changed, whether media is playing, and a fresh snapshot.", "side_effect": "high", "verification": "page_state"},
+    "inspect_web_page": {"description": "Snapshot the current page: its visible interactive elements (links, buttons, fields, players, including inside iframes), each with a ref like e12 or f1e2 for click_web_element/type_web_element.", "side_effect": "low", "verification": "page_interactive_elements"},
+    "type_web_element": {"description": "Fill a page field by its ref (pass the ref as selector); submit=true presses Enter afterwards. Returns the field's value and a fresh snapshot.", "side_effect": "high", "verification": "input_value"},
     "read_web_page": {"description": "Read the current browser page.", "side_effect": "low", "verification": "page_content"},
     "go_back": {"description": "Go back one page in the controlled browser history.", "side_effect": "medium", "verification": "url"},
     "go_forward": {"description": "Go forward one page in the controlled browser history.", "side_effect": "medium", "verification": "url"},
@@ -178,6 +180,11 @@ _ACTION_SEMANTICS: dict[str, dict[str, Any]] = {
     "email_draft_create": {"description": "Create an email draft.", "side_effect": "medium", "verification": "draft_exists"},
     "email_draft_read": {"description": "Read an email draft.", "side_effect": "low", "verification": "draft_content"},
     "email_draft_update": {"description": "Update an existing email draft.", "side_effect": "medium", "verification": "draft_content"},
+    "observe_window": {"description": "List the interactive elements (buttons, fields, list items, tabs, links) of an application window with IDs, roles, names, values and focus. Use this to see a desktop app before acting; read_screen is only for reading text.", "side_effect": "low", "verification": "uia_interactive_elements"},
+    "interact": {"description": "Act on one element from the latest observe_window by its ID: click, type, set_value, select, toggle, expand, or focus. Returns whether the window changed plus a fresh observation.", "side_effect": "high", "verification": "uia_state_change"},
+    "play_media": {"description": "Play a song or video on YouTube or YouTube Music in one verified step: searches, opens the best result, and confirms playback started. Use this instead of navigate/search/click for any play request.", "side_effect": "medium", "verification": "media_playing"},
+    "whatsapp_send_message": {"description": "Send a WhatsApp message to a chat or group in WhatsApp Desktop as one verified operation: opens WhatsApp, finds the chat, types the exact text, and sends it. Use this instead of click/type_text for WhatsApp.", "side_effect": "critical", "requires_confirmation": True, "verification": "whatsapp_composer_cleared"},
+    "whatsapp_open_chat": {"description": "Open a WhatsApp chat or group in WhatsApp Desktop and verify its conversation is showing.", "side_effect": "medium", "verification": "whatsapp_chat_header"},
     "email_send": {"description": "Send an email through the connected account.", "side_effect": "critical", "requires_confirmation": True, "verification": "message_id"},
     "email_reply": {"description": "Reply to a specific email in its existing Gmail thread.", "side_effect": "critical", "requires_confirmation": True, "verification": "message_id"},
     "email_read": {"description": "Read email from the connected account. With limit greater than 1, return message summaries; use limit=1 when the user needs the full body.", "side_effect": "low", "verification": "message_content"},
@@ -571,6 +578,43 @@ def build_default_registry(
         )
     except Exception as exc:
         logger.warning("System capability could not be registered: %s", exc)
+
+    # 5b. App skills (WhatsApp Desktop via UI Automation)
+    try:
+        from advi.capabilities.apps import MessagingCapability
+        messaging_cap = MessagingCapability()
+        registry.register(
+            Capability(
+                name="messaging",
+                description="Send messages and open chats in WhatsApp Desktop as verified single-call skills.",
+                supported_actions=messaging_cap.SUPPORTED_ACTIONS,
+                status=CapabilityStatus.AVAILABLE if messaging_cap.is_available() else CapabilityStatus.UNAVAILABLE,
+                handler=messaging_cap,
+                metadata={"optional": True},
+                availability_probe=_probe_handler,
+                availability_reason="initially registered; runtime probe pending",
+            )
+        )
+    except Exception as exc:
+        logger.warning("Messaging capability could not be registered: %s", exc)
+
+    # 5c. Structured desktop perception (UI Automation element IDs)
+    try:
+        from advi.capabilities.apps import DesktopUiCapability
+        ui_cap = DesktopUiCapability(desktop_context=shared_context)
+        registry.register(
+            Capability(
+                name="desktop_ui",
+                description="Observe application windows as interactive elements with IDs and act on them with verification.",
+                supported_actions=ui_cap.SUPPORTED_ACTIONS,
+                status=CapabilityStatus.AVAILABLE if ui_cap.is_available() else CapabilityStatus.UNAVAILABLE,
+                handler=ui_cap,
+                availability_probe=_probe_handler,
+                availability_reason="initially registered; runtime probe pending",
+            )
+        )
+    except Exception as exc:
+        logger.warning("Desktop UI capability could not be registered: %s", exc)
 
     # 6. David fallback (supported subsystem, isolated from the primary brain)
     if david_fallback_service is not None:

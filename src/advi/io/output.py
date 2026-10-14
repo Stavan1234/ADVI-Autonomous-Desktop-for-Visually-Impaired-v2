@@ -144,6 +144,11 @@ class OutputManager:
         self._progress_generation = 0
         self._state_lock = threading.RLock()
         self._closed = False
+        # Progress narration is "latest only": a phrase not yet spoken when the
+        # next phrase or the final answer arrives is dropped, so speech never
+        # trails behind what ADVI is actually doing.
+        self._narration_generation = 0
+        self._last_narration: str | None = None
 
     def close(self) -> None:
         """Release output-channel resources without racing background feedback."""
@@ -197,6 +202,37 @@ class OutputManager:
             self._progress_thread = thread
         thread.start()
 
+    def narrate(self, message: str) -> None:
+        """Announce a step as it starts (display + non-blocking speech)."""
+        message = str(message or "").strip()
+        with self._state_lock:
+            if self._closed or not message or message == self._last_narration:
+                return
+            self._last_narration = message
+            self._narration_generation += 1
+            generation = self._narration_generation
+        # A concrete step replaces the generic "Working on that."
+        self.stop_progress()
+        print(f"  ... {message}")
+        if self.tts is None:
+            return
+
+        def speak_worker() -> None:
+            with self._speech_lock:
+                with self._state_lock:
+                    if self._closed or generation != self._narration_generation or self.tts is None:
+                        return
+                try:
+                    self.tts.speak(message)
+                except Exception as exc:
+                    import logging
+                    logging.getLogger(__name__).warning("Progress narration failed: %s", exc)
+
+        try:
+            self._speech_executor.submit(speak_worker)
+        except RuntimeError:
+            pass
+
     def stop_progress(self) -> None:
         """Invalidate delayed progress speech and join only the lightweight scheduler."""
         with self._state_lock:
@@ -229,6 +265,11 @@ class OutputManager:
             return bool(display_text)
 
         speech_text = response.for_speech()
+
+        # The answer supersedes any progress phrase still waiting to be spoken.
+        with self._state_lock:
+            self._narration_generation += 1
+            self._last_narration = None
 
         if not speech_text:
             return bool(display_text)

@@ -24,6 +24,8 @@ _CAPABILITY_LABELS: dict[str, str] = {
     "email": "Email",
     "browser_control": "Browser",
     "desktop_control": "Desktop apps",
+    "messaging": "Messaging (WhatsApp)",
+    "desktop_ui": "Desktop UI (see and act on app elements)",
     "system": "System",
     "memory": "Memory",
     "mcp": "MCP",
@@ -78,7 +80,13 @@ def build_request_tools_spec(specs: Iterable[ToolSpec], *, exposed: Iterable[str
 
 def parse_requested_tools(arguments: dict[str, Any] | None) -> list[str]:
     """Normalize the ``tools`` argument; tolerate a string or comma list."""
-    raw = (arguments or {}).get("tools")
+    arguments = arguments or {}
+    # A model that calls this while it is undeclared has no schema to follow;
+    # the log shows {"name": "open_file"}. Accept the obvious variants.
+    raw = next(
+        (arguments[key] for key in ("tools", "names", "tool_names", "name", "tool") if arguments.get(key)),
+        None,
+    )
     if isinstance(raw, str):
         raw = raw.replace(";", ",").split(",")
     if not isinstance(raw, (list, tuple)):

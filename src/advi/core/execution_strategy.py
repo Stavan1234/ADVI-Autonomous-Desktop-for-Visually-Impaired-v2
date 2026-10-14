@@ -230,7 +230,7 @@ def infer_execution_strategy(
 
 def is_observation_tool(name: str) -> bool:
     return str(name or "").casefold() in {
-        "inspect_web_page", "read_web_page", "read_screen", "inspect_window",
+        "inspect_web_page", "read_web_page", "read_screen", "inspect_window", "observe_window",
         "list_windows", "list_applications", "find_application", "find_file", "list_files",
         "search_file_content", "read_file", "get_system_info", "get_system_status",
         "get_battery_status", "memory_search", "memory_retrieval", "contact_lookup", "wait",
@@ -251,7 +251,7 @@ def terminal_evidence_matches(strategy: ExecutionStrategy, tool_name: str, resul
     goal = str(task_goal or "").casefold()
 
     if strategy.family is OperationFamily.MEDIA_PLAYBACK:
-        if name != "click_web_element":
+        if name not in {"click_web_element", "play_media"}:
             return False
         playback = details.get("playback") or details.get("player") or {}
         return bool(

@@ -6,7 +6,7 @@ import logging
 import json
 import uuid
 import time
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from collections import deque
 from pathlib import Path
 
@@ -26,6 +26,7 @@ from advi.core.execution_strategy import (
     terminal_evidence_matches,
 )
 from advi.io.output import AdviResponse
+from advi.io.progress import progress_phrase
 from advi.memory.service import MemoryService
 from advi.providers.base import LLMProvider, LLMToolCall, LLMResponse
 from advi.providers.errors import (
@@ -127,6 +128,10 @@ _OPERATION_INTENT: dict[str, str] = {
 
 _TOOL_DOMAIN: dict[str, str] = {
     "open_application": ExecutionDomain.DESKTOP.value,
+    "whatsapp_send_message": ExecutionDomain.DESKTOP.value,
+    "observe_window": ExecutionDomain.DESKTOP.value,
+    "interact": ExecutionDomain.DESKTOP.value,
+    "whatsapp_open_chat": ExecutionDomain.DESKTOP.value,
     "new_document": ExecutionDomain.DESKTOP.value,
     "save_document": ExecutionDomain.DESKTOP.value,
     "save_document_as": ExecutionDomain.DESKTOP.value,
@@ -148,6 +153,8 @@ _TOOL_DOMAIN: dict[str, str] = {
     "scroll": ExecutionDomain.DESKTOP.value,
     "wait": ExecutionDomain.DESKTOP.value,
     "navigate": ExecutionDomain.BROWSER.value,
+    "open_browser": ExecutionDomain.BROWSER.value,
+    "play_media": ExecutionDomain.BROWSER.value,
     "search": ExecutionDomain.BROWSER.value,
     "click_web_element": ExecutionDomain.BROWSER.value,
     "inspect_web_page": ExecutionDomain.BROWSER.value,
@@ -198,7 +205,7 @@ _NATIVE_SIDE_EFFECT_TOOLS = {
     "create_file", "save_file", "append_file", "replace_file_text", "open_file", "open_folder",
     "create_folder", "delete_file", "copy_file", "move_file", "rename_file", "delete_folder",
     "copy_folder", "move_folder", "rename_folder", "email_draft_create", "email_draft_update",
-    "email_send", "email_reply",
+    "email_send", "email_reply", "whatsapp_send_message", "whatsapp_open_chat", "play_media", "interact",
 }
 
 _FILE_EXTENSIONS = ("pdf", "docx", "pptx", "xlsx", "txt", "csv", "md", "rtf", "json", "xml")
@@ -228,8 +235,10 @@ Operational rules:
 - For a named email recipient, call contact_lookup first. Use the returned exact address only. If none exists, ask for the address; if several match, ask which one. Never guess addresses or mine unrelated mail/files for them.
 - Use native capabilities when they can do the task reliably. Use david_fallback only when native execution is unavailable or cannot represent the task reliably. Never repeat a side-effecting action when its real-world result is uncertain.
 - When Gmail returns fallback_recommended, continue the same approved Gmail task through david_fallback and preserve exact recipient, subject, body/content, and draft_id.
-- Prefer observe → target → act → verify. For complex or unfamiliar work, slow down: use one state-changing action at a time, allow the environment to settle, observe the resulting state, and re-plan when reality differs from the previous plan. Never batch speculative side effects merely because they fit in one model response. If Windows/browser state changes unexpectedly, re-observe and re-target rather than blindly continuing. For website forms, inspect_web_page first and use the returned exact selector with type_web_element or click_web_element.
-- For a request to play/watch a specific video or song on YouTube, complete the normal browser workflow: use the ADVI-owned browser tab, open/navigate to YouTube when needed, search exactly once for the requested item, inspect the current results, choose the first suitable video (or the explicitly requested result), click/open that result, and verify the watch page and playback are actually active. Once the requested results page is already open, do not issue the same search again; act on the current results.
+- Prefer observe → target → act → verify. For complex or unfamiliar work, slow down: use one state-changing action at a time, allow the environment to settle, observe the resulting state, and re-plan when reality differs from the previous plan. Never batch speculative side effects merely because they fit in one model response. If Windows/browser state changes unexpectedly, re-observe and re-target rather than blindly continuing.
+- Websites: navigate (or open_browser), then inspect_web_page to get refs, then click_web_element / type_web_element with a ref as selector (type_web_element with submit=true to search). Each action returns a fresh snapshot; use its refs next, not old ones. Video players often sit in iframes: their refs look like f1e2. For Chrome or "the browser" use open_browser, never open_application.
+- To play a song or video on YouTube or YouTube Music, call play_media once with the title (service=youtube_music when the user says YouTube Music). It searches, opens the result, and verifies playback. Only if play_media is unavailable, fall back to the browser workflow below.
+- For a request to play/watch a specific video or song on YouTube without play_media, complete the normal browser workflow: use the ADVI-owned browser tab, open/navigate to YouTube when needed, search exactly once for the requested item, inspect the current results, choose the first suitable video (or the explicitly requested result), click/open that result, and verify the watch page and playback are actually active. Once the requested results page is already open, do not issue the same search again; act on the current results.
 - Keep responses concise and speech-friendly; explain failures concretely.
 - For Desktop, Documents, and Downloads, use folder aliases or paths returned by ADVI; never invent a Windows username inside a C:\\Users path.
 - For file requests, use native file capabilities first instead of GUI navigation when the filesystem can perform the operation directly.
@@ -240,6 +249,8 @@ Operational rules:
 - When the user asks what files/folders exist or asks to locate a file, call list_files/find_file and use the returned paths; never claim the Watchtower saw the entire computer unless the tool explicitly searched that scope.
 - When the user asks to create a PDF, Word, Excel, PowerPoint, text, or other supported file directly, use create_file with the appropriate filename; create .pdf/.docx/.xlsx/.pptx as real structured files through ADVI's native document libraries, not as plain text. When the user specifies a PDF page count or PPTX slide count, pass the requested `pages` or `slides` value. Do not claim ADVI cannot create files when that capability is available.
 - Never claim that you remembered, saved, sent, created, opened, or changed something unless the corresponding tool was actually executed successfully and its result provides evidence.
+- For WhatsApp, use whatsapp_send_message (or whatsapp_open_chat) with the chat name and the exact message text the user dictated. It runs the whole verified flow; never drive WhatsApp with click/type_text/press_key.
+- To operate a desktop application, call observe_window, then interact with an element ID from it (click, type, select, toggle, expand). Each interact returns a fresh observation; re-read it before the next step. Use read_screen only to read text, and click/type_text only when observe_window shows no usable element.
 - Each turn declares only a subset of ADVI's tools. If the task needs a tool that is not declared, call request_tools with its exact name, then use it. Never tell the user ADVI cannot do something that request_tools lists; only say so if no listed tool can do it.
 """.strip()
         self.system_prompt = system_prompt or (build_advi_system_prompt() + "\n\n" + operational_rules)
@@ -288,6 +299,9 @@ Operational rules:
         self._tool_surface_intentionally_empty = False
         # Most recent language-provider failure, for local "what's the problem?" answers.
         self._last_failure: dict[str, Any] | None = None
+        # Set by the app to the output channel's narrate(); one short phrase per
+        # meaningful tool call, so voice users hear progress during long tasks.
+        self.progress_callback: Callable[[str], None] | None = None
 
     @property
     def failed_tools(self) -> list[str]:
@@ -333,8 +347,9 @@ Operational rules:
             if spec is not None:
                 tools.append(spec.to_openai_tool())
                 names.append(name)
-        if not tools and classify_turn(text).kind not in {TurnKind.NEW_TASK, TurnKind.CONTINUE_TASK}:
-            return tools
+        # No classification gate here: a reply such as "yes, and choose topic X"
+        # reads as conversation but accepts an offer to act. With zero tools the
+        # provider runs tool_choice=none and rejects the model's tool call outright.
         if "mcp_call" in names and "mcp_list_tools" in names and len(names) <= 3:
             # An explicit MCP turn is an execution constraint; do not invite native substitutes.
             return tools
@@ -1296,6 +1311,39 @@ Operational rules:
             if current_task.context.get("fallback_available"):
                 add("david_fallback")
 
+        # Wherever coordinate/OCR GUI tools are offered, offer the structured
+        # pair too: observe_window (elements with IDs) and interact (by ID).
+        if selected & {"click", "double_click", "type_text", "press_key", "read_screen", "inspect_window"}:
+            add("observe_window", "interact")
+        # "open settings and turn on dark mode": the launch is only step one.
+        if "open_application" in selected and re.search(r"\b(?:and|then)\b|,", lower):
+            add("observe_window", "interact")
+
+        # WhatsApp chats/messages go through the verified skill, not generic
+        # click/type. Offering both let the model drive the GUI step by step
+        # (the logged failure); request_tools still reaches anything else.
+        if re.search(r"\bwhatsapp\b", signal_text) and re.search(
+            r"\b(?:send|message|text|chat|tell|type|write|reply|group)\b", lower
+        ):
+            whatsapp_tools = {"whatsapp_send_message", "whatsapp_open_chat"}
+            before = set(selected)
+            selected = set()
+            add(*whatsapp_tools)
+            if not selected:
+                selected = before
+
+        # "Play X" on YouTube/YouTube Music is one verified tool call. Local
+        # files and other streaming sites stay on the generic surfaces.
+        if re.search(r"\bplay\b", lower) and "whatsapp" not in signal_text and not re.search(
+            r"\b(?:folder|files?|mp3|wav|flac|downloads|desktop|computer|laptop|local|spotify|netflix|prime|hotstar|"
+            r"anime|episode|miruro|game)s?\b|\bfrom my\b", lower
+        ):
+            before = set(selected)
+            selected = set()
+            add("play_media")
+            if not selected:
+                selected = before
+
         # Final contract pass: add only one-step-safe dependencies to the
         # already-selected surface. This remains bounded while preventing common
         # provider rejections where the prompt permits a tool that was omitted
@@ -1984,6 +2032,11 @@ Operational rules:
         # intent is the request itself. A payload such as "send an email ...
         # include system information" must remain an email task.
         lower = str(text or "").casefold().strip().rstrip("?.! ")
+        # A local answer covers exactly one question. "what is my laptop status.
+        # and what is today's date?" was answered locally and the date was dropped.
+        clauses = [c for c in re.split(r"[.?!;]+|\band\b|\balso\b", lower) if c.strip()]
+        if len(clauses) > 1:
+            return None
         query_lead = re.match(
             r"^(?:please\s+)?(?:what|what's|whats|how|show|tell|get|give|display|check|is|do i have)\b", lower
         )
@@ -2406,6 +2459,7 @@ Operational rules:
 
     def _respond_turn(self, text: str) -> AdviResponse:
         self._missing_tool_recovery_used = False
+        self._missing_tool_recoveries = 0
         classification = classify_turn(
             text,
             task_status=getattr(self.task, "status", None),
@@ -2616,6 +2670,9 @@ Operational rules:
             observation=observation,
         )
         handoff = self._handoff()
+        # The model has no clock; without this, "what is today's date?" is a guess.
+        now_line = time.strftime("[LOCAL TIME] %A %d %B %Y, %H:%M")
+        context_text = f"{now_line}\n\n{context_text}" if context_text else now_line
         user_payload = text
         if context_text:
             user_payload = f"{context_text}\n\n[USER REQUEST]\n{text}"
@@ -3038,6 +3095,18 @@ Operational rules:
                     return AdviResponse(f"{self.last_tool_summary}. The action succeeded, but I couldn't finish the next step right now. Your progress is saved; say try again to continue.")
                 return AdviResponse(self._friendly_provider_failure(exc))
 
+    def _narrate_tool(self, call: ToolCall) -> None:
+        callback = getattr(self, "progress_callback", None)
+        if callback is None:
+            return
+        phrase = progress_phrase(call.name, call.arguments)
+        if not phrase:
+            return
+        try:
+            callback(phrase)
+        except Exception:
+            logger.debug("Progress narration failed", exc_info=True)
+
     def _track_progress(self, name: str, result: ToolResult, payload: dict[str, Any]) -> AdviResponse | None:
         """Count actions, compare screen observations, and stop a stalled loop.
 
@@ -3133,9 +3202,23 @@ Operational rules:
             detail = self.last_tool_summary or self.task.context.get("terminal_reason") or "the requested operation could not be completed"
             return f"I couldn't complete that: {detail}"
         if self.task.status == TaskStatus.UNCERTAIN:
+            if self._only_verified_observations():
+                # Nothing changed on the computer, so there is no side effect for
+                # the model to misreport; its answer *is* the result. Overriding it
+                # hid "the PDF only contains placeholder text" in the runtime log.
+                return None
             detail = self.last_tool_summary or "the final state could not be verified"
             return f"I completed the attempted action, but I couldn't verify the final state: {detail}"
         return None
+
+    def _only_verified_observations(self) -> bool:
+        outcomes = list(self.task.tool_outcomes) if self.task is not None else []
+        return bool(outcomes) and all(
+            is_observation_tool(str(item.get("tool") or item.get("name") or ""))
+            and item.get("success")
+            and item.get("verified")
+            for item in outcomes
+        )
 
     def _handle_provider_failure(self, exc: Exception) -> None:
         if self.task is None:
@@ -3817,6 +3900,7 @@ Operational rules:
         if normalized_call is not None:
             call = normalized_call
         call = self._apply_protected_task_parameters(call)
+        self._narrate_tool(call)
         if call.name == "david_fallback" and self._explicit_fallback_requested(self.last_user_message or self.task.goal):
             self.task.set_execution_route(ExecutionRoute.DAVID, explicit=True)
         if self.task.execution_route == ExecutionRoute.DAVID.value and call.name in _NATIVE_SIDE_EFFECT_TOOLS:
@@ -4054,9 +4138,12 @@ Operational rules:
             )
             domain = "browser"
         elif origin.name in desktop_actions:
+            # Structured elements (roles, names, focus) when available; OCR only
+            # as a fallback. OCR could not show where typed text went.
+            structured = self.tools.get("observe_window") is not None
             observation_call = ToolCall(
                 call_id=f"recovery-{uuid.uuid4().hex[:12]}",
-                name="read_screen",
+                name="observe_window" if structured else "read_screen",
                 arguments={},
             )
             domain = "desktop"
@@ -4078,11 +4165,25 @@ Operational rules:
             self.task.set_context("native_recovery_observation_error", observed.error or "observation failed")
             return
 
+        state = self.task.context.get("progress")
+        if not isinstance(state, dict):
+            state = progress.new_state()
+            self.task.context["progress"] = state
+        # Count internal observations too, so stalls are judged on every look at
+        # the screen, not only the ones the model asked for.
+        progress.record_observation(state, observation_call.name, observed.output)
+
         if domain == "browser":
             payload = {
                 "kind": "dom_inventory",
                 "source": "inspect_web_page",
                 "elements": observed.output if isinstance(observed.output, list) else str(observed.output or ""),
+            }
+        elif observation_call.name == "observe_window":
+            payload = {
+                "kind": "ui_elements",
+                "source": "observe_window",
+                "observation": observed.output,
             }
         else:
             payload = {
@@ -4110,8 +4211,21 @@ Operational rules:
         except Exception:
             runtime_name = None
         if not runtime_name or runtime_name == call.name:
+            return self._redirect_browser_launch(call)
+        return self._redirect_browser_launch(LLMToolCall(call_id=call.call_id, name=runtime_name, arguments=dict(call.arguments)))
+
+    _BROWSER_APP_NAMES = {"chrome", "google chrome", "browser", "web browser", "the browser", "chromium", "internet"}
+
+    def _redirect_browser_launch(self, call: LLMToolCall) -> LLMToolCall:
+        """open_application("Chrome") launches the user's personal profile (profile
+        picker, no automation port). ADVI's browser work happens in its own profile."""
+        if call.name != "open_application" or self.tools.get("open_browser") is None:
             return call
-        return LLMToolCall(call_id=call.call_id, name=runtime_name, arguments=dict(call.arguments))
+        app = str(call.arguments.get("application") or call.arguments.get("name") or "").strip().casefold()
+        if app not in self._BROWSER_APP_NAMES:
+            return call
+        trace("gateway.agent_session.browser_launch_redirected", source_component="AgentSession", application=app)
+        return LLMToolCall(call_id=call.call_id, name="open_browser", arguments={})
 
     def _normalize_list_files_call(self, call: LLMToolCall) -> LLMToolCall:
         if call.name != "list_files":
@@ -4283,6 +4397,7 @@ Operational rules:
             "close_application", "close_window", "email_draft_create",
             "email_draft_update", "email_send", "email_reply", "search_file_content",
             "memory_remember", "memory_forget",
+            "whatsapp_send_message", "whatsapp_open_chat",
             "david_fallback",
         }
         if last in terminal_tools:
@@ -4696,6 +4811,15 @@ Operational rules:
         return None
 
     def _tools_with_missing_tool(self, tools: list[dict[str, Any]], tool_name: str) -> list[dict[str, Any]] | None:
+        if tool_name == REQUEST_TOOLS_NAME:
+            names = [str(item.get("function", {}).get("name") or "") for item in tools]
+            if REQUEST_TOOLS_NAME in names:
+                return tools
+            try:
+                meta = build_request_tools_spec(self.tools.list(available_only=True), exposed=names)
+            except Exception:
+                return None
+            return [*tools, meta.to_openai_tool()] if meta is not None else None
         canonical = self.tools.runtime_name(tool_name) or tool_name
         if any(str(item.get("function", {}).get("name") or "") == canonical for item in tools):
             return tools
@@ -4720,25 +4844,16 @@ Operational rules:
         handoff: Any,
         observation: dict[str, Any] | None,
     ) -> tuple[LLMResponse, list[dict[str, Any]]] | None:
-        if self._missing_tool_recovery_used:
-            return None
-        tool_name = self._missing_tool_name(exc)
-        if not tool_name:
-            return None
-        augmented = self._tools_with_missing_tool(tools, tool_name)
-        if augmented is None:
-            return None
-        try:
-            response = self.provider_manager.send_user(
+        return self._recover_missing_tools(
+            exc,
+            tools,
+            lambda declared: self.provider_manager.send_user(
                 user_payload,
                 system_instruction=self.system_prompt,
-                tools=augmented,
+                tools=declared,
                 handoff=handoff,
-            )
-        except LLMError:
-            return None
-        self._missing_tool_recovery_used = True
-        return response, augmented
+            ),
+        )
 
     def _retry_with_missing_tool_results(
         self,
@@ -4748,25 +4863,49 @@ Operational rules:
         tools: list[dict[str, Any]],
         handoff: Any,
     ) -> tuple[LLMResponse, list[dict[str, Any]]] | None:
-        if self._missing_tool_recovery_used:
-            return None
-        tool_name = self._missing_tool_name(exc)
-        if not tool_name:
-            return None
-        augmented = self._tools_with_missing_tool(tools, tool_name)
-        if augmented is None:
-            return None
-        try:
-            response = self.provider_manager.send_tool_results(
+        return self._recover_missing_tools(
+            exc,
+            tools,
+            lambda declared: self.provider_manager.send_tool_results(
                 results,
                 system_instruction=self.system_prompt,
-                tools=augmented,
+                tools=declared,
                 handoff=handoff,
-            )
-        except LLMError:
-            return None
-        self._missing_tool_recovery_used = True
-        return response, augmented
+            ),
+        )
+
+    _MAX_MISSING_TOOL_RECOVERIES = 2
+
+    def _recover_missing_tools(
+        self,
+        exc: LLMRequestError,
+        tools: list[dict[str, Any]],
+        send: Any,
+    ) -> tuple[LLMResponse, list[dict[str, Any]]] | None:
+        """Declare the tool a provider says was missing and resend, chaining once.
+
+        One recovery was not enough in the log: the model first called an
+        undeclared create_file, then (after it was declared) an undeclared
+        request_tools. Each retry may surface the next missing tool.
+        """
+        declared = tools
+        while getattr(self, "_missing_tool_recoveries", 0) < self._MAX_MISSING_TOOL_RECOVERIES:
+            tool_name = self._missing_tool_name(exc)
+            if not tool_name:
+                return None
+            augmented = self._tools_with_missing_tool(declared, tool_name)
+            if augmented is None or augmented is declared:
+                return None
+            self._missing_tool_recoveries = getattr(self, "_missing_tool_recoveries", 0) + 1
+            self._missing_tool_recovery_used = True
+            try:
+                return send(augmented), augmented
+            except LLMRequestError as next_exc:
+                exc = next_exc
+                declared = augmented
+            except LLMError:
+                return None
+        return None
 
     def _describe_provider_failure(self, exc: Exception) -> str:
         """One spoken clause naming why the language service failed.
@@ -4982,6 +5121,8 @@ Operational rules:
             return f"delete {call.arguments.get('path', 'the selected file')}"
         if call.name == "memory_forget":
             return "remove a saved memory"
+        if call.name == "whatsapp_send_message":
+            return f"send the WhatsApp message '{str(call.arguments.get('text') or '')[:160]}' to {call.arguments.get('chat') or 'the chat'}"
         return f"run the {call.name} action"
 
     def _record(self, role: str, content: str) -> None:

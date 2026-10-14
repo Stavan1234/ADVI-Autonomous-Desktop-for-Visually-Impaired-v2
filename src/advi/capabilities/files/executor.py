@@ -189,9 +189,48 @@ class FileCapability:
                 error=str(exc),
             )
 
+    _PLACEHOLDER_PATTERNS = (
+        # The whole document is one bracketed instruction: "[Insert a 1000-word speech here]".
+        re.compile(r"^[\[<{(][^\]>})]{0,200}[\]>})]$"),
+        re.compile(r"\b(?:insert|add|put|write|paste|place)\b.{0,80}\bhere\b"),
+        re.compile(r"^(?:placeholder|todo|tbd|content goes here|text goes here)\W*$"),
+        re.compile(r"\b(?:your|the)\s+(?:speech|content|text|essay|document|story)\s+(?:goes|will go)\s+here\b"),
+    )
+
+    @classmethod
+    def _placeholder_rejection(cls, action: ToolCall, content: Any) -> ToolResult | None:
+        """Refuse to write a stand-in instead of the requested text.
+
+        In the runtime log the model, after two failed attempts, wrote
+        "[Insert a 1000-word speech here]"; it verified and ADVI reported the
+        speech as created. Only short content is checked, so real documents
+        that merely mention these words are never blocked.
+        """
+        text = str(content or "").strip()
+        if not text or len(text) > 400:
+            return None
+        lowered = text.casefold()
+        if not any(pattern.search(lowered) for pattern in cls._PLACEHOLDER_PATTERNS):
+            return None
+        return ToolResult(
+            call_id=action.call_id,
+            name=action.action,
+            success=False,
+            error=(
+                f"Content is a placeholder ({text[:80]!r}), not the requested text. "
+                "Write the complete document text in `content`; never write a stand-in."
+            ),
+            verified=False,
+            verification_status="failed",
+            verification_details={"reason": "placeholder_content", "definitive_failure": True},
+        )
+
     def _execute_save_file(self, action: ToolCall, *, approval_granted: bool = False) -> ToolResult:
         path_str = action.parameters.get("path") or action.parameters.get("filename") or action.target or ""
         content = action.parameters.get("content") or action.parameters.get("value") or ""
+        placeholder = self._placeholder_rejection(action, content)
+        if placeholder is not None:
+            return placeholder
 
         if not path_str:
             return ToolResult(
@@ -497,74 +536,19 @@ class FileCapability:
 
         if suffix == ".pdf":
             import fitz
-            document = fitz.open()
-            windir = os.environ.get("WINDIR")
-            fonts = Path(windir) / "Fonts" if windir else None
-            title_font = None
-            body_font = None
-            candidates_title = ([fonts / "segoeuisb.ttf", fonts / "calibrib.ttf"] if fonts else []) + [Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")]
-            candidates_body = ([fonts / "segoeui.ttf", fonts / "arial.ttf"] if fonts else []) + [Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")]
-            for candidate in candidates_title:
-                if candidate.is_file(): title_font=candidate; break
-            for candidate in candidates_body:
-                if candidate.is_file(): body_font=candidate; break
+            from .pdf_layout import render_polished_pdf, split_title
 
-            requested_pages=max(1,int(pages)) if pages not in (None,"") else None
-            title_lines=[x.strip() for x in content.splitlines() if x.strip()]
-            title=title_lines[0] if title_lines else "ADVI Document"
-            chunks=FileCapability._partition_content(content, requested_pages) if requested_pages else [content]
-            target_pages=requested_pages or max(1, len(chunks))
-            if len(chunks)<target_pages: chunks += [""]*(target_pages-len(chunks))
-
-            navy=(0.12,0.25,0.43); blue=(0.18,0.41,0.70); teal=(0.17,0.56,0.57); ink=(0.13,0.16,0.20); muted=(0.38,0.42,0.47); pale=(0.95,0.97,0.99); white=(1,1,1)
-
-            def insert(page, rect, text, size, *, fontfile=None, color=ink, align=0):
-                kwargs={"fontsize":size,"color":color,"align":align,"lineheight":1.2}
-                if fontfile is not None: kwargs["fontfile"]=str(fontfile)
-                return page.insert_textbox(rect, str(text), **kwargs)
-
-            for idx, chunk in enumerate(chunks[:target_pages], start=1):
-                page=document.new_page(width=595, height=842)
-                page.draw_rect(fitz.Rect(0,0,595,92), color=navy, fill=navy)
-                insert(page, fitz.Rect(42,20,555,67), title, 24 if idx==1 else 18, fontfile=title_font, color=white)
-                insert(page, fitz.Rect(42,66,555,84), f"ADVI • polished-colorful  •  {idx:02d}/{target_pages:02d}", 8.5, fontfile=body_font, color=(0.78,0.88,0.97))
-                y=122
-                lines=[ln.strip() for ln in str(chunk).splitlines() if ln.strip()]
-                rest=lines[1:] if idx==1 and lines else lines
-                i=0
-                while i<len(rest) and y<790:
-                    line=rest[i]
-                    if line.startswith("|") and line.endswith("|"):
-                        table=[]
-                        while i<len(rest) and rest[i].startswith("|") and rest[i].endswith("|"):
-                            cells=[c.strip() for c in rest[i][1:-1].split("|")]
-                            if not all(re.fullmatch(r":?-{3,}:?", c.replace(" ","")) for c in cells): table.append(cells)
-                            i+=1
-                        if len(table)>=2:
-                            cols=max(len(r) for r in table); x0=42; width=511/cols; rh=27
-                            for r,row in enumerate(table):
-                                for c in range(cols):
-                                    cell=fitz.Rect(x0+c*width,y,x0+(c+1)*width,y+rh)
-                                    fill=navy if r==0 else (0.985,0.988,0.992)
-                                    page.draw_rect(cell,color=(0.78,0.82,0.88),fill=fill,width=0.6)
-                                    insert(page,fitz.Rect(cell.x0+5,cell.y0+5,cell.x1-5,cell.y1-5),row[c] if c<len(row) else "",8.5,fontfile=body_font,color=white if r==0 else ink)
-                            y+=rh*len(table)+16
-                        continue
-                    if re.match(r"^#{1,3}\s+", line) or (len(line)<90 and line.endswith(":")):
-                        heading=re.sub(r"^#{1,3}\s+", "", line).rstrip(":")
-                        box=fitz.Rect(42,y,553,y+31); page.draw_rect(box,color=(0.85,0.90,0.95),fill=(0.92,0.95,0.98),width=0)
-                        insert(page,fitz.Rect(52,y+5,543,y+27),heading,12,fontfile=title_font,color=blue); y+=43
-                    else:
-                        bullet=line if line.startswith(("•","- ")) else line
-                        box=fitz.Rect(42,y,553,min(y+62,790)); page.draw_rect(box,color=(0.86,0.88,0.91),fill=pale,width=0.5)
-                        insert(page,fitz.Rect(53,y+8,542,min(y+55,785)),bullet,10.8,fontfile=body_font,color=ink)
-                        y+=70
-                    i+=1
-            document.save(path); document.close()
-            check=fitz.open(str(path))
+            fallback_title = re.sub(r"[_-]+", " ", path.stem).strip().title() or "ADVI Document"
+            title, body = split_title(content, fallback_title)
+            requested_pages = max(1, int(pages)) if pages not in (None, "") else None
+            chunks = FileCapability._partition_content(body, requested_pages) if requested_pages else [body]
+            render_polished_pdf(path, chunks, title=title)
+            check = fitz.open(str(path))
             try:
-                if len(check)<1 or not any((page.get_text("text") or "").strip() for page in check): raise RuntimeError("Generated PDF is empty or unreadable.")
-            finally: check.close()
+                if len(check) < 1 or not any((page.get_text("text") or "").strip() for page in check):
+                    raise RuntimeError("Generated PDF is empty or unreadable.")
+            finally:
+                check.close()
             return True, "pymupdf-polished"
 
         return False, ""
@@ -574,6 +558,9 @@ class FileCapability:
         content = action.parameters.get("content") if action.parameters.get("content") is not None else action.parameters.get("value", "")
         if not path_str:
             return ToolResult(call_id=action.call_id, name=action.action, success=False, error="No file path or filename provided.")
+        placeholder = self._placeholder_rejection(action, content)
+        if placeholder is not None:
+            return placeholder
 
         target_file = self.resolve_path(str(path_str))
         blocked = self._check_write_path(action, target_file, operation="create", approval_granted=approval_granted)
@@ -1314,6 +1301,18 @@ class FileCapability:
         return None, None, None
 
     @staticmethod
+    def _window_title_names_file(hwnd: int, path: Path) -> bool:
+        if os.name != "nt":
+            return False
+        user32 = ctypes.windll.user32
+        if not user32.IsWindow(hwnd):
+            return False
+        buffer = ctypes.create_unicode_buffer(512)
+        user32.GetWindowTextW(hwnd, buffer, 512)
+        title = buffer.value.casefold()
+        return bool(title) and (path.name.casefold() in title or path.stem.casefold() in title)
+
+    @staticmethod
     def _activate_opened_window(hwnd: int) -> bool:
         if os.name != "nt":
             return False
@@ -1359,8 +1358,16 @@ class FileCapability:
         if self.desktop_context is not None:
             try:
                 active_path = getattr(self.desktop_context, "active_document_path", None)
-                if active_path and Path(str(active_path)).resolve() == target.resolve():
-                    hwnd = getattr(self.desktop_context, "target_hwnd", None)
+                hwnd = getattr(self.desktop_context, "target_hwnd", None)
+                # A surviving browser/viewer window is not proof the document is
+                # still in it: the log shows Edge reused after the PDF tab was
+                # closed. Reuse only while the window title still names the file.
+                if (
+                    active_path
+                    and Path(str(active_path)).resolve() == target.resolve()
+                    and hwnd
+                    and self._window_title_names_file(int(hwnd), target)
+                ):
                     focused = bool(hwnd and getattr(self.desktop_context, "target_hwnd", None) and self._activate_opened_window(int(hwnd))) if hwnd else False
                     verified = bool(focused)
                     return ToolResult(

@@ -99,11 +99,13 @@ ACTION_CONTRACTS: dict[str, ActionContract] = {
     }),
     "navigate": ActionContract("navigate", {"url": ParameterRule(required=True)}, True),
     "search": ActionContract("search", {"query": ParameterRule(required=True, aliases=("value",))}),
-    "click_web_element": ActionContract("click_web_element", {"selector": ParameterRule(required=True)}, True),
+    "click_web_element": ActionContract("click_web_element", {"selector": ParameterRule(required=True, aliases=("ref", "element"), description="Element ref from the latest inspect_web_page, e.g. e12 or f1e2.")}, True),
+    "open_browser": ActionContract("open_browser", {"url": ParameterRule(description="Optional page to open.")}),
     "inspect_web_page": ActionContract("inspect_web_page", {"limit": ParameterRule(kind="integer")}),
     "type_web_element": ActionContract("type_web_element", {
-        "selector": ParameterRule(required=True, aliases=("target", "field")),
+        "selector": ParameterRule(required=True, aliases=("target", "field", "ref"), description="Field ref from the latest inspect_web_page, e.g. e3."),
         "text": ParameterRule(required=True, aliases=("value", "content")),
+        "submit": ParameterRule(kind="bool", description="Press Enter after typing (e.g. to run a search)."),
     }, True),
     "read_web_page": ActionContract("read_web_page"),
     "go_back": ActionContract("go_back"),
@@ -176,6 +178,46 @@ ACTION_CONTRACTS: dict[str, ActionContract] = {
     # Send accepts either an existing draft_id or a complete message.
     # Conditional validation (draft_id OR to+subject+body) is enforced by the
     # Gmail capability rather than pretending the schema can express it directly.
+    "observe_window": ActionContract(
+        "observe_window",
+        {
+            "application": ParameterRule(aliases=("app", "window", "title"),
+                                         description="Window title to observe; omit for the app ADVI is working in."),
+        },
+    ),
+    "interact": ActionContract(
+        "interact",
+        {
+            "element_id": ParameterRule(required=True, aliases=("id", "element"),
+                                        description="Element ID from the latest observe_window, e.g. e7."),
+            "action": ParameterRule(description="click (default), type, set_value, select, toggle, expand, or focus."),
+            "text": ParameterRule(aliases=("value", "content"), description="Text for type/set_value."),
+        },
+    ),
+    "play_media": ActionContract(
+        "play_media",
+        {
+            "query": ParameterRule(required=True, aliases=("song", "title", "video", "search"),
+                                   description="What to play, e.g. song title and artist."),
+            "service": ParameterRule(description="youtube (default) or youtube_music."),
+        },
+    ),
+    "whatsapp_send_message": ActionContract(
+        "whatsapp_send_message",
+        {
+            "chat": ParameterRule(required=True, aliases=("contact", "name", "recipient", "to", "group"),
+                                  description="Exact WhatsApp chat or group name as the user said it."),
+            "text": ParameterRule(required=True, aliases=("message", "body", "content"),
+                                  description="Exact message text to send, as the user dictated it."),
+        },
+    ),
+    "whatsapp_open_chat": ActionContract(
+        "whatsapp_open_chat",
+        {
+            "chat": ParameterRule(required=True, aliases=("contact", "name", "recipient", "to", "group"),
+                                  description="Exact WhatsApp chat or group name as the user said it."),
+        },
+    ),
     "email_send": ActionContract(
         "email_send",
         {

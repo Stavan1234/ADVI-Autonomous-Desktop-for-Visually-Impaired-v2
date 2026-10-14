@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
+from pathlib import Path
 from typing import Any
 
 from advi.capabilities.desktop.context import DesktopContext
@@ -135,11 +137,37 @@ class ExecutionEngine:
             )
 
         verified = self.verifier.verify(call, result)
-        return _finish_execution(verified)
+        return _finish_execution(_discard_unverified_creation(call, result, verified))
 
     def execute(self, call: ToolCall) -> ToolResult:
         """Explicit alias for the canonical native execution operation."""
         return self.execute_tool_call(call)
+
+def _discard_unverified_creation(call: ToolCall, raw: ToolResult, verified: ToolResult) -> ToolResult:
+    """Remove a file this same call created when verification proved it wrong.
+
+    create_file never overwrites, so a file it reports as created is new. In
+    the runtime log three bad PDFs were left on the Desktop, and the leftover
+    name made the model's next attempt fail with "File already exists".
+    """
+    if call.name != "create_file" or verified.verified:
+        return verified
+    details = dict(verified.verification_details or {})
+    if not details.get("definitive_failure") or not (raw.metadata or {}).get("created"):
+        return verified
+    path_str = (raw.metadata or {}).get("resolved_path")
+    if not path_str:
+        return verified
+    try:
+        Path(str(path_str)).unlink()
+    except OSError as exc:
+        logger.warning("Could not discard unverified file %s: %s", path_str, exc)
+        return verified
+    details["discarded_invalid_file"] = str(path_str)
+    error = (verified.error or "Verification failed.") + " The invalid file was removed, so the same name can be reused."
+    trace("gateway.execution_engine.discarded_invalid_file", source_component="ExecutionEngine", path=str(path_str))
+    return dataclasses.replace(verified, error=error, verification_details=details)
+
 
 def _tool_result_fields(result: ToolResult) -> dict[str, Any]:
     return {

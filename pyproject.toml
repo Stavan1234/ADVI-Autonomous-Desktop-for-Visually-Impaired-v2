@@ -28,6 +28,9 @@ dependencies = [
     "python-docx>=1.1.0",
     "pymupdf>=1.24.0",
     "mcp>=2.2.0,<3.0.0",
+    # Browser automation engine (actionability waits, iframe access). Drives the
+    # installed Chrome via channel="chrome"; no separate browser download needed.
+    "playwright>=1.64.0,<2.0.0",
     "sentence-transformers>=6.1.0,<7.0.0",
     "numpy>=2.0.0",
 ]
