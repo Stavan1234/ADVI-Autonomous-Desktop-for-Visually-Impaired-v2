@@ -103,6 +103,7 @@ def test_open_world_browser_journey_uses_brain_for_semantic_result_and_local_con
         ],
     )
     session = AgentSession([provider], tool_registry=tools, tool_runner=runner, tool_guard=guard)
+    session.local_intents_enabled = False  # exercises the model loop
 
     response = session.respond('Go to Amazon and search for "2TB SSD"')
 
@@ -173,6 +174,7 @@ def test_desktop_uncertain_typing_aborts_stale_followup_side_effect():
         ],
     )
     session = AgentSession([provider], tool_registry=tools, tool_runner=runner, tool_guard=guard)
+    session.local_intents_enabled = False  # exercises the model loop
     response = session.respond("Type Hello from advi into the WhatsApp message box and send it")
 
     assert executed[0] == "type_text"
@@ -226,6 +228,7 @@ def test_provider_schema_repair_does_not_rotate_provider_and_preserves_same_task
     tools = _tool_registry("type_web_element")
     # Simulate AgentSession's one-shot repair path directly through its helper.
     session = AgentSession([first, second], tool_registry=tools, tool_runner=FakeRunner(lambda c: _verified(c)), tool_guard=ToolGuard(tools))
+    session.local_intents_enabled = False  # exercises the model loop
     session._handoff = lambda: None
     try:
         manager.send_user(

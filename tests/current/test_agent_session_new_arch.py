@@ -61,6 +61,7 @@ def make_session(responses):
     tools = ToolRegistry(registry)
     runner = ToolRunner(engine, ToolGuard(tools))
     session = AgentSession([FakeProvider(responses)], tool_registry=tools, tool_runner=runner, tool_guard=runner.guard)
+    session.local_intents_enabled = False  # exercises the model loop
     return session, engine
 
 
@@ -149,6 +150,7 @@ def test_multiple_tool_calls_in_one_model_response_share_one_round():
         tool_guard=guard,
         max_tool_rounds=1,
     )
+    session.local_intents_enabled = False  # exercises the model loop
 
     response = session.respond("Open both apps")
     assert response.text == "Done"
@@ -180,6 +182,7 @@ def test_confirm_pending_fallback_is_not_recorded_as_failed_outcome():
         tool_runner=ToolRunner(engine, guard),
         tool_guard=guard,
     )
+    session.local_intents_enabled = False  # exercises the model loop
     session.task = __import__("advi.agent.contracts", fromlist=["TaskState"]).TaskState(goal="x", task_id="t1")
     result = ToolResult(
         call_id="c1",

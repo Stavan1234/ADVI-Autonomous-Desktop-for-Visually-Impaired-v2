@@ -127,8 +127,9 @@ def test_battery_query_uses_local_tool_without_creating_task():
 def test_capability_query_does_not_create_task():
     session = make_session()
     response = session.respond("what are your capabilities")
-    assert response.text.lower().startswith("my currently available capabilities are:")
-    assert "get_battery_status" in response.text
+    # Spoken sentences, never raw tool identifiers.
+    assert response.text.startswith("I can ")
+    assert "battery" in response.text and "get_battery_status" not in response.text
     assert session.task is None
 
 

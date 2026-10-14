@@ -63,8 +63,12 @@ class IntentService:
         else:
             m=re.search(r"\bsubject\s*(?::|is|=|to)?\s*(.*?)\s+\b(?:and\s+)?(?:body|message|saying|say)\b",text,re.I)
             if m: subject=m.group(1).strip()
+        if re.fullmatch(r"\(?\s*(?:none|no subject|empty)\s*\)?", subject, re.I):
+            subject = ""
         body=""
-        m=re.search(r"\b(?:body|message|saying|say)\s*(?::|is|=|to)?\s*[\"“](.*?)[\"”]\s*[.!?]?\s*$",text,re.I)
+        # A quoted body may be followed by more words ('body "good evening" to that address').
+        m=re.search(r"\b(?:body|saying|say|says)\s*(?::|is|=)?\s*[\"“](.+?)[\"”]",text,re.I) or \
+            re.search(r"\bmessage\s*(?::|is|=)?\s*[\"“](.+?)[\"”]",text,re.I)
         if m:
             body=m.group(1).strip()
         else:
@@ -78,13 +82,15 @@ class IntentService:
         self,
         user_input: str,
     ) -> Intent:
-        deterministic_search = self._deterministic_web_search_intent(user_input)
-        if deterministic_search is not None:
-            return deterministic_search
-
+        # Email first: "Open Gmail, search for email x@y.com, compose and send ..."
+        # was read as a Google search because of "search for" (runtime log).
         deterministic = self._deterministic_email_intent(user_input)
         if deterministic is not None:
             return deterministic
+
+        deterministic_search = self._deterministic_web_search_intent(user_input)
+        if deterministic_search is not None:
+            return deterministic_search
 
         full_prompt = (
             f"{self.prompt}\n\n"

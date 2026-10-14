@@ -730,6 +730,7 @@ class CDPBrowser:
             const controls = Array.from(document.querySelectorAll('button,[role="button"],div[command]')).filter(visible);
             const candidates = controls.filter(el => {
                 const l=label(el);
+                if (/feedback|schedule|more send options|send to/.test(l)) return false;
                 return /(^|\s)send(\s|$)|send message/.test(l);
             });
             if (!candidates.length) return {clicked:false, reason:'send_control_not_found'};
@@ -748,39 +749,51 @@ class CDPBrowser:
             return False
         if not state.get('clicked'):
             return False
+        verify_script=r"""
+        (() => {
+            const body=String(document.body?.innerText || '').replace(/\s+/g,' ').trim().toLowerCase();
+            const visible = el => { const s=getComputedStyle(el), r=el.getBoundingClientRect();
+                return s.display!=='none' && s.visibility!=='hidden' && r.width>0 && r.height>0; };
+            const compose = Array.from(document.querySelectorAll('[contenteditable="true"], textarea[name="body"]')).some(visible);
+            const sent=/\bmessage sent\b|\bsending\.\.\./.test(body);
+            return {sent, composeOpen:compose, url:location.href};
+        })()
+        """
+
+        def wait_sent(seconds: float) -> bool:
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                try:
+                    v = self.evaluate_js(tab_id, verify_script) or {}
+                    if v.get('sent'):
+                        return True
+                    if not v.get('composeOpen') and 'mail.google.com' in str(v.get('url') or '').casefold():
+                        # Compose closing is the secondary signal when Gmail hides the toast.
+                        time.sleep(0.4)
+                        v2 = self.evaluate_js(tab_id, verify_script) or {}
+                        if not v2.get('composeOpen'):
+                            return True
+                except Exception:
+                    pass
+                time.sleep(0.3)
+            return False
+
+        if wait_sent(2.5):
+            return True
+        # The DOM click did nothing (Gmail sometimes listens only for real
+        # pointer events). Only now send one trusted click; clicking twice
+        # unconditionally hit whatever lay under the closed compose window.
         rect = state.get('rect') if isinstance(state.get('rect'), dict) else None
         if rect:
             try:
                 x=float(rect.get('x',0))+float(rect.get('width',0))/2
                 y=float(rect.get('y',0))+float(rect.get('height',0))/2
+                self.execute_cdp_command(tab_id,'Input.dispatchMouseEvent',{'type':'mouseMoved','x':x,'y':y,'button':'none'})
                 self.execute_cdp_command(tab_id,'Input.dispatchMouseEvent',{'type':'mousePressed','x':x,'y':y,'button':'left','clickCount':1})
                 self.execute_cdp_command(tab_id,'Input.dispatchMouseEvent',{'type':'mouseReleased','x':x,'y':y,'button':'left','clickCount':1})
             except Exception:
                 pass
-        deadline=time.monotonic()+max(1.0,timeout)
-        verify_script=r"""
-        (() => {
-            const body=String(document.body?.innerText || '').replace(/\s+/g,' ').trim().toLowerCase();
-            const compose = document.querySelector('[contenteditable="true"], textarea[name="body"]');
-            const sent=/message sent|sent to/.test(body);
-            return {sent, composeOpen:!!compose, url:location.href};
-        })()
-        """
-        while time.monotonic()<deadline:
-            try:
-                v=self.evaluate_js(tab_id,verify_script) or {}
-                if v.get('sent'):
-                    return True
-                if not v.get('composeOpen') and 'mail.google.com' in str(v.get('url') or '').casefold():
-                    # Compose disappearing is a useful secondary signal when Gmail suppresses the toast.
-                    time.sleep(0.4)
-                    v2=self.evaluate_js(tab_id,verify_script) or {}
-                    if not v2.get('composeOpen'):
-                        return True
-            except Exception:
-                pass
-            time.sleep(0.4)
-        return False
+        return wait_sent(max(1.0, timeout))
 
     def verify_action_state(
         self,

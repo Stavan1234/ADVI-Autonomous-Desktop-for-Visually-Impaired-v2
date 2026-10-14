@@ -17,6 +17,18 @@ from .cdp import CDPBrowser
 logger = logging.getLogger(__name__)
 
 
+_HUMAN_CHECK_TITLE = re.compile(
+    r"prove your humanity|are you a robot|verify (?:you are|you're) (?:a )?human|just a moment|attention required"
+    r"|captcha|unusual traffic|access denied|security check",
+    re.I,
+)
+_CONSEQUENTIAL_CLICK = re.compile(
+    r"\b(?:buy|purchase|pay|payment|checkout|check out|place (?:your |the )?order|confirm (?:order|payment|booking|purchase|transfer)|"
+    r"proceed to (?:pay|payment|checkout)|transfer|send money|donate|book now|reserve|subscribe|submit|apply now|"
+    r"submit application|delete|remove account|close account|unsubscribe|publish|post|send)\b"
+)
+
+
 class BrowserCapability:
     """
     Browser Automation Capability.
@@ -25,6 +37,7 @@ class BrowserCapability:
     """
 
     SUPPORTED_ACTIONS = {
+        "media_control",
         "open_browser",
         "play_media",
         "navigate",
@@ -102,6 +115,7 @@ class BrowserCapability:
                 error=f"Unsupported browser action: {action.action}",
             )
 
+        self._approval_granted = approval_granted
         try:
             # Ensure Chrome is running and tab is ready before executing browser action
             if not self._ensure_chrome_running():
@@ -425,18 +439,34 @@ class BrowserCapability:
             return ToolResult(call_id=action.call_id, name=action.action, success=False, error="No ADVI-owned Chrome tab is available.")
         base = "https://music.youtube.com/search?q=" if music else "https://www.youtube.com/results?search_query="
         url = base + urllib.parse.quote_plus(query)
-        if not self.cdp.navigate_tab(tab_id=tab_id, url=url, timeout=12.0):
+        navigated = False
+        if self._pw_enabled():
+            # The legacy websocket navigate timed out on a busy tab (runtime log);
+            # Playwright navigation waits on real load events instead.
+            try:
+                browser, _page = self._pw_ready()
+                browser.goto(url)
+                navigated = True
+            except Exception as exc:
+                logger.warning("Playwright navigation for play_media failed: %s", exc)
+        if not navigated:
+            try:
+                navigated = bool(self.cdp.navigate_tab(tab_id=tab_id, url=url, timeout=12.0))
+            except Exception as exc:
+                logger.warning("CDP navigation for play_media failed: %s", exc)
+            wait_dom = getattr(self.cdp, "wait_for_dom_ready", None)
+            if navigated and callable(wait_dom):
+                wait_dom(tab_id, timeout=8.0)
+        if not navigated:
             return ToolResult(call_id=action.call_id, name=action.action, success=False, error=f"I couldn't open the search page for '{query}'.")
-        wait_dom = getattr(self.cdp, "wait_for_dom_ready", None)
-        if callable(wait_dom):
-            wait_dom(tab_id, timeout=8.0)
         self.context.target_tab_url = url
-        if music:
-            result = self._pw_play_best_match(action, query) if self._pw_enabled() else None
-            if result is None or not result.success:
-                result = self._youtube_music_play_requested_result(action, tab_id) or result
+        best = self._pw_play_best_match(action, query) if self._pw_enabled() else None
+        if best is not None and best.success:
+            result = best
+        elif music:
+            result = self._youtube_music_play_requested_result(action, tab_id) or best
         else:
-            result = self._youtube_play_first_result(action, "play", tab_id)
+            result = self._youtube_play_first_result(action, "play", tab_id) or best
         if result is None:
             return ToolResult(
                 call_id=action.call_id, name=action.action, success=False, output=query,
@@ -2022,6 +2052,19 @@ class BrowserCapability:
         except Exception as exc:
             logger.warning("Playwright navigate failed, using legacy CDP: %s", exc)
             return self._legacy_navigate(action)
+        if _HUMAN_CHECK_TITLE.search(str(info.get("title") or "")):
+            # Reddit answered a search with "Prove your humanity" and this was
+            # reported as a verified page. ADVI never solves these checks.
+            site = urllib.parse.urlsplit(info["url"]).netloc.removeprefix("www.") or "The site"
+            message = (f"{site} is asking to confirm you're a human before it shows the page. "
+                       "It's open in the browser; please complete that check yourself, then ask me again.")
+            return ToolResult(
+                call_id=action.call_id, name=action.action, success=False, output=info["url"],
+                error=message, human_readable=message, verified=False, verification_status="failed",
+                verification_details={"method": "playwright_goto", "current_url": info["url"], "human_check": True},
+                metadata={"current_url": info["url"], "expected_url": url, "tab_title": info["title"],
+                          "failure_class": "human_verification_required", "engine": "playwright"},
+            )
         return ToolResult(
             call_id=action.call_id, name=action.action, success=True, output=info["url"],
             human_readable=f"Opened {info['title'] or info['url']}.",
@@ -2057,6 +2100,17 @@ class BrowserCapability:
             return self._legacy_click_web_element(action)
         try:
             browser, page = self._pw_ready()
+            label = next((str(e.get("name") or "") for e in (browser.latest.elements if browser.latest else []) if e.get("ref") == ref), "")
+            if _CONSEQUENTIAL_CLICK.search(label.casefold()) and not getattr(self, "_approval_granted", False):
+                # Buying, paying, sending, submitting or deleting on a website
+                # needs the user's yes first, like email_send and WhatsApp.
+                return ToolResult(
+                    call_id=action.call_id, name=action.action, success=False,
+                    requires_confirmation=True,
+                    confirmation_reason=f"click '{label}' on {page.url.split('?')[0]}",
+                    error=f"Clicking '{label}' may buy, pay, send, submit or delete something; it needs the user's confirmation.",
+                    metadata={"selector": ref, "label": label, "consequential": True},
+                )
             before_url = page.url
             outcome = browser.act(ref, "click")
             media = browser.media_state() if outcome.details else {"playing": False}
@@ -2178,9 +2232,75 @@ class BrowserCapability:
             except Exception:
                 pass
         playing = bool(media.get("playing"))
-        summary = f"Playing '{best.get('name')}'." if playing else f"I clicked '{best.get('name')}' but playback did not start."
+        # Result links carry the length in their accessible name ("... 3 minutes, 37 seconds"),
+        # which ADVI then read aloud.
+        title = re.sub(r"\s+(?:\d+\s+hours?,?\s*)?(?:\d+\s+minutes?,?\s*)?(?:\d+\s+seconds?)?\s*$", "", str(best.get('name') or "")).strip() or best.get('name')
+        title = re.sub(r"^Play\s+Radio\s*\W\s*", "", str(title)).strip() or title
+        summary = f"Playing '{title}'." if playing else f"I clicked '{title}' but playback did not start."
         return self._pw_result(
             action, success=playing, summary=summary, output=query,
             details={"method": "playwright_best_match_play", "selected": best.get("name"), "playing": playing,
                      "playback": media, "click": outcome.message},
+        )
+
+    _MEDIA_KEYS = {"pause": 0xB3, "resume": 0xB3, "toggle": 0xB3, "next": 0xB0, "previous": 0xB1, "volume_up": 0xAF, "volume_down": 0xAE, "mute": 0xAD}
+
+    def _execute_media_control(self, action: ToolCall) -> ToolResult:
+        """Pause / resume / next for what ADVI is playing.
+
+        "stop" after playing a song used to do nothing. Media in ADVI's browser
+        is controlled directly and verified; anything else (a local player)
+        gets the Windows media key, like a keyboard media button.
+        """
+        op = str(action.parameters.get("action") or "pause").strip().casefold()
+        if op in {"stop", "halt"}:
+            op = "pause"
+        if op in {"play", "continue", "unpause"}:
+            op = "resume"
+        op = {"louder": "volume_up", "quieter": "volume_down", "unmute": "mute", "volume up": "volume_up",
+              "volume down": "volume_down"}.get(op, op)
+        if op not in self._MEDIA_KEYS:
+            return ToolResult(call_id=action.call_id, name=action.action, success=False, error=f"Unknown media action '{op}'.")
+        if op in {"pause", "resume"} and self._pw_enabled():
+            from . import pw_session
+
+            browser = pw_session._shared
+            if browser is not None and browser.page is not None and not browser.page.is_closed():
+                script = ("() => { const m = Array.from(document.querySelectorAll('video,audio')); "
+                          + ("m.forEach(x => x.pause());" if op == "pause" else "m.forEach(x => { if (x.paused && x.currentTime > 0) x.play(); });")
+                          + " return m.length; }")
+                found = 0
+                for frame in browser.page.frames:
+                    try:
+                        found += int(frame.evaluate(script) or 0)
+                    except Exception:
+                        continue
+                if found:
+                    time.sleep(0.6)
+                    playing = bool(browser.media_state().get("playing"))
+                    ok = (not playing) if op == "pause" else playing
+                    word = "Paused" if op == "pause" else "Resumed"
+                    return ToolResult(
+                        call_id=action.call_id, name=action.action, success=ok,
+                        human_readable=f"{word}." if ok else f"I tried, but media is {'still' if playing else 'not'} playing.",
+                        verified=ok, verification_status="verified" if ok else "uncertain",
+                        verification_details={"method": "browser_media_elements", "playing": playing},
+                    )
+        if os.name != "nt":
+            return ToolResult(call_id=action.call_id, name=action.action, success=False, error="Media keys are only supported on Windows.")
+        import ctypes
+
+        key = self._MEDIA_KEYS[op]
+        user32 = ctypes.windll.user32
+        # One volume key press is 2%; "volume up" means a noticeable step.
+        for _ in range(5 if op in {"volume_up", "volume_down"} else 1):
+            user32.keybd_event(key, 0, 0, 0)
+            user32.keybd_event(key, 0, 2, 0)
+        word = {"pause": "Paused", "resume": "Resumed", "toggle": "Toggled playback", "next": "Skipped to the next track",
+                "previous": "Went back a track", "volume_up": "Turned the volume up", "volume_down": "Turned the volume down",
+                "mute": "Toggled mute"}[op]
+        return ToolResult(
+            call_id=action.call_id, name=action.action, success=True,
+            human_readable=f"{word} with the media key.", verified=False, verification_status="uncertain",
+            verification_details={"method": "windows_media_key", "key": hex(key)},
         )

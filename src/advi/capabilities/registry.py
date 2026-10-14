@@ -159,6 +159,7 @@ _ACTION_SEMANTICS: dict[str, dict[str, Any]] = {
     "reload_page": {"description": "Reload the current page in the controlled browser.", "side_effect": "medium", "verification": "page_state"},
     "research_web": {"description": "Search the web, open a relevant result, and read the resulting page.", "side_effect": "medium", "verification": "page_content"},
     "save_file": {"description": "Write content to a local file.", "side_effect": "high", "verification": "file_exists_and_content"},
+    "word_create_document": {"description": "Write a document in Microsoft Word and save it, in one verified step: give the full text as content using # Title, ## Heading, - bullets, 1. numbered items, | tables |, > quotes and **bold**. Word applies real styles, page numbers, and saves as .docx (or exports .pdf) at path (folder aliases like desktop/documents work; name clashes are never overwritten), then opens it in Word. Use whenever the user mentions Word or MS Word.", "side_effect": "high", "verification": "word_saved_file_read_back"},
     "create_file": {"description": "Create a new local file. For .pdf/.docx/.xlsx/.pptx ALWAYS generate the real binary container using PyMuPDF/python-docx/openpyxl/python-pptx, never plain text. For PDF use text content and optional pages; for PPTX use slide text blocks and optional slides; for XLSX provide CSV-style rows; for DOCX provide paragraphs.", "side_effect": "high", "verification": "structured_file_parse"},
     "append_file": {"description": "Append content to an existing local file.", "side_effect": "high", "verification": "file_contains_appended_content"},
     "replace_file_text": {"description": "Replace an exact text occurrence in an existing local file.", "side_effect": "high", "verification": "file_contains_replacement"},
@@ -180,11 +181,18 @@ _ACTION_SEMANTICS: dict[str, dict[str, Any]] = {
     "email_draft_create": {"description": "Create an email draft.", "side_effect": "medium", "verification": "draft_exists"},
     "email_draft_read": {"description": "Read an email draft.", "side_effect": "low", "verification": "draft_content"},
     "email_draft_update": {"description": "Update an existing email draft.", "side_effect": "medium", "verification": "draft_content"},
+    "media_control": {"description": "Pause, resume, or skip the song or video that is playing (in ADVI's browser or another player), or change the system volume (volume_up, volume_down, mute).", "side_effect": "low", "verification": "media_state"},
+    "play_local_media": {"description": "Play a song or video file saved on this computer (Videos, Music, Downloads, Desktop) in the default player, matched by title words. Use when the user means their own file, not YouTube.", "side_effect": "medium", "verification": "player_window"},
+    "move_files": {"description": "Move all matching files (by extension or name) from one folder into another in one step; creates the destination, never overwrites, and can be undone. Use this instead of many move_file calls.", "side_effect": "high", "verification": "bulk_move_disk_check"},
+    "organize_folder": {"description": "Sort a folder's loose files into Documents, Images, Videos, Audio, Archives and Installers subfolders by type, in one step; can be undone.", "side_effect": "high", "verification": "bulk_move_disk_check"},
+    "undo_file_operation": {"description": "Undo the most recent move_files or organize_folder batch, putting the files back where they were.", "side_effect": "high", "verification": "journal_undo"},
     "observe_window": {"description": "List the interactive elements (buttons, fields, list items, tabs, links) of an application window with IDs, roles, names, values and focus. Use this to see a desktop app before acting; read_screen is only for reading text.", "side_effect": "low", "verification": "uia_interactive_elements"},
     "interact": {"description": "Act on one element from the latest observe_window by its ID: click, type, set_value, select, toggle, expand, or focus. Returns whether the window changed plus a fresh observation.", "side_effect": "high", "verification": "uia_state_change"},
     "play_media": {"description": "Play a song or video on YouTube or YouTube Music in one verified step: searches, opens the best result, and confirms playback started. Use this instead of navigate/search/click for any play request.", "side_effect": "medium", "verification": "media_playing"},
     "whatsapp_send_message": {"description": "Send a WhatsApp message to a chat or group in WhatsApp Desktop as one verified operation: opens WhatsApp, finds the chat, types the exact text, and sends it. Use this instead of click/type_text for WhatsApp.", "side_effect": "critical", "requires_confirmation": True, "verification": "whatsapp_composer_cleared"},
     "whatsapp_open_chat": {"description": "Open a WhatsApp chat or group in WhatsApp Desktop and verify its conversation is showing.", "side_effect": "medium", "verification": "whatsapp_chat_header"},
+    "telegram_send_message": {"description": "Send a Telegram message to a chat, group or channel in Telegram Desktop as one verified operation: opens Telegram, finds the chat, types the exact text, sends it and checks it posted. Use this instead of click/type_text for Telegram.", "side_effect": "critical", "requires_confirmation": True, "verification": "telegram_screen_check"},
+    "telegram_open_chat": {"description": "Open a Telegram chat, group or channel in Telegram Desktop and verify its conversation is showing.", "side_effect": "medium", "verification": "telegram_screen_check"},
     "email_send": {"description": "Send an email through the connected account.", "side_effect": "critical", "requires_confirmation": True, "verification": "message_id"},
     "email_reply": {"description": "Reply to a specific email in its existing Gmail thread.", "side_effect": "critical", "requires_confirmation": True, "verification": "message_id"},
     "email_read": {"description": "Read email from the connected account. With limit greater than 1, return message summaries; use limit=1 when the user needs the full body.", "side_effect": "low", "verification": "message_content"},
@@ -586,7 +594,7 @@ def build_default_registry(
         registry.register(
             Capability(
                 name="messaging",
-                description="Send messages and open chats in WhatsApp Desktop as verified single-call skills.",
+                description="Send messages and open chats in WhatsApp Desktop and Telegram Desktop as verified single-call skills.",
                 supported_actions=messaging_cap.SUPPORTED_ACTIONS,
                 status=CapabilityStatus.AVAILABLE if messaging_cap.is_available() else CapabilityStatus.UNAVAILABLE,
                 handler=messaging_cap,
@@ -597,6 +605,24 @@ def build_default_registry(
         )
     except Exception as exc:
         logger.warning("Messaging capability could not be registered: %s", exc)
+
+    # 5b2. Microsoft Office (Word via its automation interface)
+    try:
+        from advi.capabilities.office import OfficeCapability
+        office_cap = OfficeCapability()
+        registry.register(
+            Capability(
+                name="office",
+                description="Create formatted Microsoft Word documents and save them as .docx or .pdf.",
+                supported_actions=office_cap.SUPPORTED_ACTIONS,
+                status=CapabilityStatus.AVAILABLE if office_cap.is_available() else CapabilityStatus.UNAVAILABLE,
+                handler=office_cap,
+                metadata={"optional": True},
+                availability_reason="Word automation registered" if office_cap.is_available() else "Microsoft Word is not installed",
+            )
+        )
+    except Exception as exc:
+        logger.warning("Office capability could not be registered: %s", exc)
 
     # 5c. Structured desktop perception (UI Automation element IDs)
     try:

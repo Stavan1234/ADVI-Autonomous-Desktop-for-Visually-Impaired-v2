@@ -1,4 +1,6 @@
-# ADVI — Windows Setup
+# ADVI — Windows Setup (reference)
+
+Most people only need the quick start in `README.md`. This page is the detailed reference.
 
 ## Requirements
 
@@ -6,7 +8,7 @@
 - Python 3.13.x
 - Google Chrome
 - An API key for at least one supported LLM provider
-- Tesseract OCR is optional; install it only if visual OCR fallback is needed
+- Tesseract OCR (recommended): needed for Telegram and screen reading; `winget install UB-Mannheim.TesseractOCR`
 
 ## Install
 

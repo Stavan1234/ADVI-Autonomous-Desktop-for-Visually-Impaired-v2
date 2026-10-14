@@ -118,3 +118,39 @@ def test_best_match_play_refuses_weak_matches_and_unverified_playback(monkeypatc
     monkeypatch.setattr(cap, "_pw_ready", lambda: (silent, silent.page))
     result = cap._pw_play_best_match(ToolCall("p", "play_media", {}), "Overflow Transformation Worship")
     assert result is not None and not result.success and "did not start" in result.human_readable
+
+
+def _gated_browser(monkeypatch, label):
+    cap = BrowserCapability()
+    browser = FakeBrowser([{"ref": "e1", "role": "button", "name": label}])
+    browser.latest = browser.snap
+    browser.page = SimpleNamespace(url="https://shop.example/cart?x=1")
+    monkeypatch.setattr(cap, "_pw_enabled", lambda: True)
+    monkeypatch.setattr(cap, "_pw_ready", lambda: (browser, browser.page))
+    monkeypatch.setattr(cap, "_ensure_chrome_running", lambda: True)
+    return cap, browser
+
+
+def test_consequential_web_clicks_need_confirmation(monkeypatch):
+    cap, browser = _gated_browser(monkeypatch, "Place order")
+    blocked = cap.execute(ToolCall("c", "click_web_element", {"selector": "e1"}))
+    assert blocked.requires_confirmation and browser.clicked == []
+    assert "Place order" in blocked.confirmation_reason
+
+    approved = cap.execute(ToolCall("c", "click_web_element", {"selector": "e1"}), approval_granted=True)
+    assert browser.clicked == ["e1"] and not approved.requires_confirmation
+
+
+def test_ordinary_web_clicks_are_not_gated(monkeypatch):
+    cap, browser = _gated_browser(monkeypatch, "Play Daily Lives of High School Boys")
+    result = cap.execute(ToolCall("c", "click_web_element", {"selector": "e1"}))
+    assert not result.requires_confirmation and browser.clicked == ["e1"]
+
+
+def test_a_bot_check_page_is_reported_not_verified():
+    from advi.capabilities.browser import executor as ex
+
+    for title in ("Reddit - Prove your humanity", "Just a moment...", "Google: unusual traffic"):
+        assert ex._HUMAN_CHECK_TITLE.search(title), title
+    for title in ("Amazon.in : wireless earbuds", "Inbox (189) - Gmail", "python tips : r/learnpython"):
+        assert not ex._HUMAN_CHECK_TITLE.search(title), title

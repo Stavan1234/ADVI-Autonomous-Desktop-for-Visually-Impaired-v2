@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 from advi.tools.contracts import ToolCall, ToolResult, VerificationStatus
 
+from .telegram import TelegramSkill
 from .whatsapp import SkillOutcome, WhatsAppSkill
 
 
@@ -16,11 +17,17 @@ class MessagingCapability:
     driving click/type/read_screen one LLM round trip at a time.
     """
 
-    SUPPORTED_ACTIONS = {"whatsapp_send_message", "whatsapp_open_chat"}
+    SUPPORTED_ACTIONS = {"whatsapp_send_message", "whatsapp_open_chat", "telegram_send_message", "telegram_open_chat"}
 
-    def __init__(self, skill_factory: Callable[[], WhatsAppSkill] | None = None) -> None:
+    def __init__(
+        self,
+        skill_factory: Callable[[], WhatsAppSkill] | None = None,
+        telegram_factory: Callable[[], TelegramSkill] | None = None,
+    ) -> None:
         self._skill_factory = skill_factory or _default_skill
         self._skill: WhatsAppSkill | None = None
+        self._telegram_factory = telegram_factory or _default_telegram
+        self._telegram: TelegramSkill | None = None
 
     def is_available(self) -> bool:
         return os.name == "nt"
@@ -30,6 +37,17 @@ class MessagingCapability:
             self._skill = self._skill_factory()
         return self._skill
 
+    def _get_telegram(self) -> TelegramSkill:
+        if self._telegram is None:
+            self._telegram = self._telegram_factory()
+        return self._telegram
+
+    def _execute_telegram_send_message(self, call: ToolCall, *, approval_granted: bool = False) -> ToolResult:
+        return self.execute(call, approval_granted=approval_granted)
+
+    def _execute_telegram_open_chat(self, call: ToolCall, *, approval_granted: bool = False) -> ToolResult:
+        return self.execute(call, approval_granted=approval_granted)
+
     def _execute_whatsapp_send_message(self, call: ToolCall, *, approval_granted: bool = False) -> ToolResult:
         return self.execute(call, approval_granted=approval_granted)
 
@@ -38,14 +56,16 @@ class MessagingCapability:
 
     def execute(self, call: ToolCall, *, approval_granted: bool = False) -> ToolResult:
         action = call.action
+        app = "telegram" if action.startswith("telegram_") else "whatsapp"
+        label = app.title() if app == "telegram" else "WhatsApp"
         chat = str(call.parameters.get("chat") or "").strip()
         if not chat:
-            return ToolResult(call_id=call.call_id, name=action, success=False, error="Which WhatsApp chat? No chat name was given.")
+            return ToolResult(call_id=call.call_id, name=action, success=False, error=f"Which {label} chat? No chat name was given.")
         try:
-            skill = self._get_skill()
-            if action == "whatsapp_open_chat":
+            skill = self._get_telegram() if app == "telegram" else self._get_skill()
+            if action in {"whatsapp_open_chat", "telegram_open_chat"}:
                 outcome = skill.open_chat(chat)
-            elif action == "whatsapp_send_message":
+            elif action in {"whatsapp_send_message", "telegram_send_message"}:
                 text = str(call.parameters.get("text") or "")
                 if not text.strip():
                     return ToolResult(call_id=call.call_id, name=action, success=False, error="No message text was given.")
@@ -53,8 +73,8 @@ class MessagingCapability:
             else:
                 return ToolResult(call_id=call.call_id, name=action, success=False, error=f"Unsupported messaging action: {action}")
         except Exception as exc:
-            return ToolResult(call_id=call.call_id, name=action, success=False, error=f"WhatsApp automation failed: {exc}")
-        return _to_result(call, outcome)
+            return ToolResult(call_id=call.call_id, name=action, success=False, error=f"{label} automation failed: {exc}")
+        return _to_result(call, outcome, app)
 
 
 class DesktopUiCapability:
@@ -142,8 +162,15 @@ def _default_skill() -> WhatsAppSkill:
     return WhatsAppSkill(WindowsUiaDriver())
 
 
-def _to_result(call: ToolCall, outcome: SkillOutcome) -> ToolResult:
-    details: dict[str, Any] = {"method": "whatsapp_uia_skill", "stage": outcome.stage, **outcome.evidence}
+def _default_telegram() -> TelegramSkill:
+    from .telegram import WindowsTelegramScreen
+
+    return TelegramSkill(WindowsTelegramScreen())
+
+
+def _to_result(call: ToolCall, outcome: SkillOutcome, app: str = "whatsapp") -> ToolResult:
+    method = "telegram_keyboard_ocr_skill" if app == "telegram" else "whatsapp_uia_skill"
+    details: dict[str, Any] = {"method": method, "stage": outcome.stage, **outcome.evidence}
     if outcome.candidates:
         details["candidates"] = outcome.candidates
     # The skill only fails *before* the irreversible step, or reports that it
@@ -162,5 +189,5 @@ def _to_result(call: ToolCall, outcome: SkillOutcome) -> ToolResult:
             VerificationStatus.UNCERTAIN if outcome.stage == "sent" else VerificationStatus.FAILED
         ),
         verification_details=details,
-        metadata={"stage": outcome.stage, "app": "whatsapp"},
+        metadata={"stage": outcome.stage, "app": app},
     )

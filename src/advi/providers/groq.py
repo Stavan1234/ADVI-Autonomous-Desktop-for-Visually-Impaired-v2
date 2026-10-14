@@ -458,7 +458,7 @@ class GroqProvider(LLMProvider):
                     response = self._client.chat.completions.create(**request_kwargs)
                 except Exception as retry_exc:
                     trace("groq.tool_calling.error", provider=self.name, model=self._model, llm_call_id=llm_id, error=sanitize_string(str(retry_exc)))
-                    raise LLMRequestError(f"Groq rejected tool-calling request (400): {sanitize_string(str(retry_exc))}") from retry_exc
+                    raise _with_failed_call(LLMRequestError(f"Groq rejected tool-calling request (400): {sanitize_string(str(retry_exc))}"), retry_exc) from retry_exc
             else:
                 trace("groq.tool_calling.error", provider=self.name, model=self._model, llm_call_id=llm_id, error=safe_msg)
                 if status == 429:
@@ -468,7 +468,7 @@ class GroqProvider(LLMProvider):
                 if status == 498 or (status is not None and status >= 500):
                     raise LLMUnavailableError(f"Groq service error ({status}): {safe_msg}") from exc
                 if status in (400, 413, 422):
-                    raise LLMRequestError(f"Groq rejected tool-calling request ({status}): {safe_msg}") from exc
+                    raise _with_failed_call(LLMRequestError(f"Groq rejected tool-calling request ({status}): {safe_msg}"), exc) from exc
                 raise LLMRequestError(f"Groq API error ({status}): {safe_msg}") from exc
             if status == 429:
                 raise _build_rate_limit_error(exc) from exc
@@ -477,7 +477,7 @@ class GroqProvider(LLMProvider):
             if status == 498 or (status is not None and status >= 500):
                 raise LLMUnavailableError(f"Groq service error ({status}): {safe_msg}") from exc
             if status in (400, 413, 422):
-                raise LLMRequestError(f"Groq rejected tool-calling request ({status}): {safe_msg}") from exc
+                raise _with_failed_call(LLMRequestError(f"Groq rejected tool-calling request ({status}): {safe_msg}"), exc) from exc
             raise LLMRequestError(f"Groq API error ({status}): {safe_msg}") from exc
         
 
@@ -612,3 +612,37 @@ class GroqProvider(LLMProvider):
         )
         trace("groq.structured.response.normalized", provider=self.name, model=self.model, llm_call_id=llm_id, normalized=llm_response_to_dict(llm_response))
         return llm_response
+
+
+def _with_failed_call(error: LLMRequestError, exc: Exception) -> LLMRequestError:
+    """Attach the model's rejected tool call (Groq's ``failed_generation``) as data.
+
+    Groq rejects a call to a tool that was not declared that turn, but returns
+    the complete call. The agent can execute it locally (after its own guard
+    and contract checks) instead of spending another rate-limited round.
+    """
+    import json
+
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        body = body.get("error", body)
+    generated = body.get("failed_generation") if isinstance(body, dict) else None
+    if not isinstance(generated, str):
+        return error
+    try:
+        data = json.loads(generated)
+    except ValueError:
+        return error
+    if isinstance(data, list) and len(data) == 1:
+        data = data[0]
+    if not isinstance(data, dict) or not isinstance(data.get("name"), str):
+        return error
+    arguments = data.get("arguments") or data.get("parameters") or {}
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError:
+            return error
+    if isinstance(arguments, dict):
+        error.failed_call = {"name": data["name"], "arguments": arguments}
+    return error

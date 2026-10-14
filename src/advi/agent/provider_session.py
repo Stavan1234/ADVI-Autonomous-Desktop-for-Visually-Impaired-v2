@@ -338,6 +338,19 @@ class ProviderSession:
         self.messages.append({"role": "user", "content": content})
         return self._run_with_deadline(self._send_stateless)
 
+    def seed_turn(self, content: str, response: LLMResponse) -> bool:
+        """Record a user turn and its assistant reply without calling the provider.
+
+        Used when a provider rejected a request but returned the model's intended
+        tool call: the agent runs that call locally, and the history must show it
+        as the assistant's reply so the tool results that follow are valid.
+        """
+        if self.closed or self.native is not None:
+            return False
+        self.messages.append({"role": "user", "content": content})
+        self.record_assistant(response)
+        return True
+
     def send_tool_results(
         self,
         results: list[tuple[LLMToolCall, dict[str, Any]]],
@@ -848,6 +861,29 @@ class ProviderSessionManager:
 
         self.last_attempts = tuple(failures)
         raise last_error or self._all_blocked_error()
+
+    def adopt_rejected_call(
+        self,
+        content: str,
+        response: LLMResponse,
+        *,
+        system_instruction: str,
+        tools: list[dict[str, Any]],
+        handoff: SessionHandoff | None = None,
+    ) -> bool:
+        """Continue on the active provider as if ``response`` had been returned for ``content``."""
+        try:
+            if self.session is None:
+                self.session = ProviderSession.create(
+                    self.providers[self.active_index],
+                    system_instruction=system_instruction,
+                    tools=tools,
+                    handoff=handoff,
+                )
+            return self.session.seed_turn(content, response)
+        except Exception:
+            self._close_session()
+            return False
 
     def send_tool_results(
         self,

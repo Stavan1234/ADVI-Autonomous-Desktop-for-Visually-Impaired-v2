@@ -98,7 +98,7 @@ def test_request_tools_loads_an_unrouted_capability_and_keeps_it_for_the_task():
     # declared and ADVI claimed it could not create PDFs.
     provider = _ScriptedProvider([
         _tool_call(REQUEST_TOOLS_NAME, {"tools": ["create_file"]}, "c1"),
-        _tool_call("create_file", {"path": "speech.pdf", "content": "Be brave."}, "c2"),
+        _tool_call("create_file", {"path": "speech.pdf", "content": "Be brave, for God is with you. " * 25}, "c2"),
         _text("Created speech.pdf."),
     ])
     session, engine = _session(provider, {
@@ -204,6 +204,7 @@ def test_completed_local_app_launch_reports_the_app_instead_of_crashing():
     # _respond_turn referenced an undefined name `app` on this path (NameError).
     provider = _ScriptedProvider([])
     session, engine = _session(provider, {"desktop_control": {"find_application", "open_application"}})
+    session.local_intents_enabled = False  # this test covers the preflight path
 
     response = session.respond("open the notepad application")
 
@@ -368,12 +369,12 @@ def test_provider_failure_is_named_and_explained_locally_on_follow_up():
     ])
     session, _engine = _session(provider, {"desktop_control": {"open_application"}})
 
-    first = session.respond("open notepad and type hello")
+    first = session.respond("open notepad and write a poem about rain")
     assert "quota" in first.text
 
     follow_up = session.respond("what is the problem?")
     assert "quota" in follow_up.text
-    assert "open notepad and type hello" in follow_up.text
+    assert "open notepad and write a poem about rain" in follow_up.text
     assert len(provider.offered) == 1
 
 

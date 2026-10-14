@@ -91,18 +91,19 @@ class DavidAdapter:
             getattr(result, "results", None) or []
         )
 
-        if not text:
-            successful = [
-                item
-                for item in results
-                if getattr(item, "success", False)
-            ]
-
-            if successful:
-                text = "David completed the fallback task."
-
         result_metadata = dict(getattr(result, "metadata", {}) or {})
         success = bool(getattr(result, "success", False))
+        if not text:
+            # The log reported "David completed the fallback task." for a run
+            # whose navigate step timed out, because an earlier step had passed.
+            if success:
+                text = "David completed the fallback task."
+            else:
+                failed = next((item for item in reversed(results) if not getattr(item, "success", False)), None)
+                if failed is not None:
+                    step = str(getattr(failed, "action", "") or "a step").replace("_", " ")
+                    error = str(getattr(failed, "error", "") or "it failed")
+                    text = f"David couldn't finish: the {step} step failed ({error})."
         execution_reason = str(result_metadata.get("reason") or "").strip()
         if not execution_reason:
             execution_reason = "fallback execution failed" if not success else ""

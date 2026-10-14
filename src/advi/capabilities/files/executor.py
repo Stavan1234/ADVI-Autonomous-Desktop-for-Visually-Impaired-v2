@@ -27,7 +27,17 @@ class FileCapability:
     Provides direct local file creation, reading, and path resolution (e.g. Desktop folder).
     """
 
+    @staticmethod
+    def _trash(path: Path) -> tuple[bool, str | None]:
+        from .bulk import send_to_recycle_bin
+
+        return send_to_recycle_bin(path)
+
     SUPPORTED_ACTIONS = {
+        "play_local_media",
+        "move_files",
+        "organize_folder",
+        "undo_file_operation",
         "save_file",
         "create_file",
         "append_file",
@@ -96,10 +106,16 @@ class FileCapability:
         if not parts:
             return self.desktop_dir
 
+        home = Path(get_environment_paths().user_home)
         aliases = {
             "desktop": self.desktop_dir,
             "documents": get_environment_paths().documents,
             "downloads": get_environment_paths().downloads,
+            # "Videos" used to fall through to Desktop\Videos.
+            "videos": self._known_folder("18989B1D-99B5-455B-841C-AB7C74E4DDFC", home / "Videos"),
+            "music": self._known_folder("4BD8D571-6D19-48D3-BE97-422220080E43", home / "Music"),
+            "pictures": self._known_folder("33E28130-4E1E-4676-835A-98395C3BC3BB", home / "Pictures"),
+            "photos": self._known_folder("33E28130-4E1E-4676-835A-98395C3BC3BB", home / "Pictures"),
         }
         base = aliases.get(parts[0].casefold())
         if base is not None:
@@ -998,13 +1014,17 @@ class FileCapability:
         if not target_file.exists():
             return ToolResult(call_id=action.call_id, name=action.action, success=False, error=f"File not found: {target_file}")
 
-        target_file.unlink()
+        recycled, problem = self._trash(target_file)
+        if not recycled:
+            return ToolResult(call_id=action.call_id, name=action.action, success=False,
+                              error=f"I didn't delete '{target_file.name}': {problem}",
+                              verification_details={"path": str(target_file), "reason": "recycle_bin_unavailable"})
         return ToolResult(
             call_id=action.call_id,
             name=action.action,
             success=True,
             output=str(target_file),
-            human_readable=f"Deleted file {target_file.name}.",
+            human_readable=f"Moved {target_file.name} to the Recycle Bin.",
             verified=not target_file.exists(),
             verification_status="verified" if not target_file.exists() else "failed",
             verification_details={"path": str(target_file), "exists": target_file.exists()},
@@ -1178,16 +1198,17 @@ class FileCapability:
         if not target.is_dir():
             return ToolResult(call_id=action.call_id, name=action.action, success=False, error=f"Not a folder: {target}")
         recursive = bool(action.parameters.get("recursive", False))
-        try:
-            if recursive:
-                shutil.rmtree(target)
-            else:
-                target.rmdir()
-        except OSError as exc:
-            return ToolResult(call_id=action.call_id, name=action.action, success=False, error=(f"Could not delete folder '{target}'. It may contain files; set recursive=true to remove its contents. Details: {exc}"))
+        if not recursive and any(target.iterdir()):
+            return ToolResult(call_id=action.call_id, name=action.action, success=False,
+                              error=f"Folder '{target.name}' is not empty; set recursive=true to remove it with its contents.")
+        recycled, problem = self._trash(target)
+        if not recycled:
+            return ToolResult(call_id=action.call_id, name=action.action, success=False,
+                              error=f"I didn't delete folder '{target.name}': {problem}",
+                              verification_details={"path": str(target), "reason": "recycle_bin_unavailable"})
         gone = not target.exists()
         return ToolResult(call_id=action.call_id, name=action.action, success=gone, output=str(target),
-                          human_readable=f"Deleted folder '{target.name}'.",
+                          human_readable=f"Moved folder '{target.name}' to the Recycle Bin.",
                           verified=gone, verification_status="verified" if gone else "uncertain",
                           verification_details={"path": str(target), "exists": target.exists(), "recursive": recursive},
                           metadata={"path": str(target), "recursive": recursive})
@@ -1202,7 +1223,15 @@ class FileCapability:
             return blocked
         if target.exists():
             if target.is_dir():
-                return ToolResult(call_id=action.call_id, name=action.action, success=False, error=f"Folder already exists: {target}", metadata={"path": str(target), "already_exists": True})
+                # The requested state already holds; failing here broke "try again"
+                # on a half-finished "create a folder and move files" task.
+                return ToolResult(
+                    call_id=action.call_id, name=action.action, success=True, output=str(target),
+                    human_readable=f"Folder '{target.name}' already exists in {target.parent}.",
+                    verified=True, verification_status="verified",
+                    verification_details={"path": str(target), "exists": True, "is_directory": True, "already_exists": True},
+                    metadata={"path": str(target), "resolved_path": str(target), "already_exists": True, "is_directory": True},
+                )
             return ToolResult(call_id=action.call_id, name=action.action, success=False, error=f"A file already exists at: {target}")
         target.mkdir(parents=True, exist_ok=False)
         return ToolResult(
@@ -1531,6 +1560,10 @@ class FileCapability:
         stem_match = bool(stem_needle and Path(name).suffix == "")
         matches: list[str] = []
         stem_matches: list[str] = []
+        # Partial matches: every word of the query appears in the name. Used only
+        # when nothing matches exactly, and labelled as partial for confirmation.
+        query_words = [w for w in re.findall(r"\w+", Path(name).stem.casefold() if not wildcard else "") if len(w) > 1]
+        partial_matches: list[str] = []
         started = time.monotonic()
         deadline = started + 20.0
         seen: set[str] = set()
@@ -1597,6 +1630,10 @@ class FileCapability:
                         matched = fnmatch.fnmatchcase(filename_fold, needle) if wildcard else filename_fold == needle
                         stem_hit = bool(stem_match and Path(filename).stem.casefold() == stem_needle)
                         if not matched and not stem_hit:
+                            if query_words and len(partial_matches) < limit:
+                                words = set(re.findall(r"\w+", filename_fold))
+                                if all(any(w.startswith(q) for w in words) for q in query_words):
+                                    partial_matches.append(str(Path(current_root) / filename))
                             continue
                         full = str(Path(current_root) / filename)
                         key = full.casefold()
@@ -1616,7 +1653,25 @@ class FileCapability:
 
         if not matches and stem_matches:
             matches = stem_matches[:limit]
+        if not matches and partial_matches:
+            partial_matches.sort(key=lambda value: len(Path(value).name))
+            result = self._file_search_result(action, name, scope, partial_matches[:limit], started,
+                                              timed_out=time.monotonic() >= deadline)
+            return self._as_partial(result, name)
         return self._file_search_result(action, name, scope, matches, started, timed_out=time.monotonic() >= deadline)
+
+    @staticmethod
+    def _as_partial(result: ToolResult, name: str) -> ToolResult:
+        """Label name-contains matches so the model confirms instead of assuming."""
+        count = len(result.output or [])
+        return ToolResult(
+            call_id=result.call_id, name=result.name, success=True, output=result.output,
+            human_readable=(f"No file is named exactly '{name}', but {count} file(s) contain all of its words. "
+                            "Use one if it is clearly what the user meant; otherwise ask."),
+            verified=result.verified, verification_status=result.verification_status,
+            verification_details={**dict(result.verification_details or {}), "match": "partial"},
+            metadata={**dict(result.metadata or {}), "match": "partial"},
+        )
 
     def _search_roots_for_scope(self, scope: str, paths: Any) -> list[Path]:
         normalized = str(scope or "computer").casefold().strip()
@@ -1628,7 +1683,27 @@ class FileCapability:
             return [paths.downloads]
         if normalized in {"user", "home", "profile"}:
             return [paths.user_home]
+        # Without these, "the Videos folder" fell back to a whole-computer scan
+        # and hit the 20 s limit (runtime log, 2026-10-14).
+        media = {"videos": ("Videos", "18989B1D-99B5-455B-841C-AB7C74E4DDFC"), "video": ("Videos", "18989B1D-99B5-455B-841C-AB7C74E4DDFC"),
+                 "music": ("Music", "4BD8D571-6D19-48D3-BE97-422220080E43"),
+                 "pictures": ("Pictures", "33E28130-4E1E-4676-835A-98395C3BC3BB"), "photos": ("Pictures", "33E28130-4E1E-4676-835A-98395C3BC3BB")}
+        if normalized in media:
+            folder, guid = media[normalized]
+            return [self._known_folder(guid, Path(paths.user_home) / folder)]
         return self._search_roots_for_computer(paths)
+
+    @staticmethod
+    def _known_folder(guid: str, fallback: Path) -> Path:
+        try:
+            from advi.environment.environment import _windows_known_folder
+
+            found = _windows_known_folder(guid)
+            if found and Path(found).is_dir():
+                return Path(found)
+        except Exception:
+            pass
+        return fallback
 
     @staticmethod
     def _search_roots_for_computer(paths: Any) -> list[Path]:
@@ -1838,7 +1913,7 @@ class FileCapability:
     def _execute_list_files(self, action: ToolCall, *, approval_granted: bool = False) -> ToolResult:
         """List a bounded directory view with optional extension, recursion, and scope."""
         scope = str(action.parameters.get("scope") or "").strip().casefold()
-        dir_str = str(action.parameters.get("directory") or action.target or "").strip()
+        dir_str = str(action.parameters.get("directory") or action.parameters.get("path") or action.parameters.get("folder") or action.target or "").strip()
         paths = get_environment_paths()
         if not dir_str and scope:
             scope_paths = {
@@ -1980,3 +2055,147 @@ class FileCapability:
             metadata={"directory":str(dir_path),"count":count,"file_count":len(files),"directory_count":len(folders),"directories":[item["name"] for item in folders],"extension":extension or None,"recursive":recursive,"scope":scope or None,"sort_by":sort_by,"descending":descending,"include_metadata":include_metadata,"limit":limit},
         )
 
+    # --- bulk operations (one call, verified, undoable) ---------------------
+    def _bulk_result(self, action: ToolCall, outcome: dict[str, Any], *, summary: str) -> ToolResult:
+        moved = outcome.get("moved") or []
+        failed = outcome.get("failed") or []
+        ok = not failed
+        if failed:
+            summary += f" {len(failed)} file(s) could not be moved: " + ", ".join(f["file"] for f in failed[:5]) + "."
+        if moved:
+            summary += " Say 'undo' to put them back."
+        return ToolResult(
+            call_id=action.call_id, name=action.action, success=ok or bool(moved),
+            output={"moved": [Path(target).name for _source, target in moved][:50], "moved_count": len(moved),
+                    "failed": failed[:20], "created_folders": outcome.get("created_dirs") or []},
+            human_readable=summary, error=None if ok else summary,
+            verified=ok, verification_status="verified" if ok else "uncertain",
+            verification_details={"method": "bulk_move_disk_check", "moved": len(moved), "failed": len(failed),
+                                  "journal_batch": outcome.get("batch_id")},
+            metadata={"journal_batch": outcome.get("batch_id")},
+        )
+
+    def _execute_move_files(self, action: ToolCall, *, approval_granted: bool = False) -> ToolResult:
+        from .bulk import move_batch, select_files
+
+        params = action.parameters
+        source = self.resolve_path(str(params.get("source") or params.get("from") or ""))
+        destination = self.resolve_path(str(params.get("destination") or params.get("to") or ""))
+        if not source.is_dir():
+            return ToolResult(call_id=action.call_id, name=action.action, success=False, error=f"Source folder not found: {source}")
+        for path, operation in ((source, "move files out of"), (destination, "move files into")):
+            blocked = self._check_write_path(action, path, operation=operation, approval_granted=approval_granted)
+            if blocked is not None:
+                return blocked
+        files = [f for f in select_files(source, extensions=params.get("extensions"), name_contains=params.get("name_contains"))
+                 if f.parent.resolve() != destination.resolve()]
+        if not files:
+            return ToolResult(
+                call_id=action.call_id, name=action.action, success=True, output={"moved": [], "moved_count": 0},
+                human_readable=f"No matching files to move in {source}.", verified=True, verification_status="verified",
+                verification_details={"method": "bulk_move_disk_check", "moved": 0},
+            )
+        outcome = move_batch([(f, destination) for f in files], operation=f"move {len(files)} file(s) to {destination}")
+        return self._bulk_result(action, outcome, summary=f"Moved {len(outcome['moved'])} file(s) from {source.name} to {destination}.")
+
+    def _execute_organize_folder(self, action: ToolCall, *, approval_granted: bool = False) -> ToolResult:
+        from .bulk import move_batch, organize_plan
+
+        folder = self.resolve_path(str(action.parameters.get("folder") or action.parameters.get("path") or ""))
+        if not folder.is_dir():
+            return ToolResult(call_id=action.call_id, name=action.action, success=False, error=f"Folder not found: {folder}")
+        blocked = self._check_write_path(action, folder, operation="organize", approval_granted=approval_granted)
+        if blocked is not None:
+            return blocked
+        plan, counts, left = organize_plan(folder)
+        if not plan:
+            return ToolResult(
+                call_id=action.call_id, name=action.action, success=True, output={"moved_count": 0},
+                human_readable=f"{folder.name} has no loose files of known types to organize.",
+                verified=True, verification_status="verified", verification_details={"method": "bulk_move_disk_check", "moved": 0},
+            )
+        outcome = move_batch(plan, operation=f"organize {folder}")
+        by_type = ", ".join(f"{count} to {name}" for name, count in sorted(counts.items()))
+        summary = f"Organized {folder.name}: {by_type}."
+        if left:
+            summary += f" {left} file(s) of other types were left in place."
+        return self._bulk_result(action, outcome, summary=summary)
+
+    def _execute_undo_file_operation(self, action: ToolCall, *, approval_granted: bool = False) -> ToolResult:
+        from .bulk import undo_last
+
+        outcome = undo_last()
+        if outcome.get("restored") is None:
+            return ToolResult(call_id=action.call_id, name=action.action, success=False, error=outcome.get("message"))
+        summary = f"Undid '{outcome.get('operation')}': {outcome['restored']} file(s) back in place."
+        if outcome["failed"]:
+            summary += f" {len(outcome['failed'])} could not be restored: " + ", ".join(f["file"] for f in outcome["failed"][:5]) + "."
+        return ToolResult(
+            call_id=action.call_id, name=action.action, success=bool(outcome["ok"] or outcome["restored"]),
+            output=outcome, human_readable=summary, error=None if outcome["ok"] else summary,
+            verified=bool(outcome["ok"]), verification_status="verified" if outcome["ok"] else "uncertain",
+            verification_details={"method": "journal_undo", "restored": outcome["restored"], "failed": len(outcome["failed"])},
+        )
+
+    _MEDIA_EXTENSIONS = {"mp4", "mkv", "avi", "mov", "wmv", "webm", "m4v", "mp3", "wav", "m4a", "flac", "aac", "ogg", "wma"}
+
+    def _execute_play_local_media(self, action: ToolCall, *, approval_granted: bool = False) -> ToolResult:
+        """Play a song or video saved on this computer in the default player.
+
+        "Play here I am to worship" after listing the Videos folder went to
+        YouTube (runtime log). Media folders are searched by query words, the
+        best match is opened with its associated player, and the player window
+        is verified by open_file.
+        """
+        query = str(action.parameters.get("query") or action.parameters.get("name") or "").strip()
+        words = [w for w in re.findall(r"\w+", query.casefold()) if len(w) > 1]
+        if not words:
+            return ToolResult(call_id=action.call_id, name=action.action, success=False, error="What should I play? No title was given.")
+        paths = get_environment_paths()
+        roots = [
+            self._known_folder("18989B1D-99B5-455B-841C-AB7C74E4DDFC", Path(paths.user_home) / "Videos"),
+            self._known_folder("4BD8D571-6D19-48D3-BE97-422220080E43", Path(paths.user_home) / "Music"),
+            Path(paths.downloads), Path(paths.desktop),
+        ]
+        folder = str(action.parameters.get("folder") or "").strip()
+        if folder:
+            roots.insert(0, self.resolve_path(folder))
+        deadline = time.monotonic() + 6.0
+        scored: list[tuple[float, int, Path]] = []
+        for root in roots:
+            if not root.is_dir():
+                continue
+            base_depth = len(root.parts)
+            for current, dirs, files in os.walk(root):
+                if time.monotonic() > deadline:
+                    break
+                if len(Path(current).parts) - base_depth >= 3:
+                    dirs[:] = []
+                for filename in files:
+                    if Path(filename).suffix.lstrip(".").casefold() not in self._MEDIA_EXTENSIONS:
+                        continue
+                    name_words = set(re.findall(r"\w+", Path(filename).stem.casefold()))
+                    covered = sum(1 for w in words if any(n.startswith(w) for n in name_words)) / len(words)
+                    if covered >= 0.75:
+                        scored.append((covered, len(filename), Path(current) / filename))
+        if not scored:
+            searched = ", ".join(r.name for r in roots if r.is_dir())
+            return ToolResult(
+                call_id=action.call_id, name=action.action, success=False,
+                error=f"No song or video on this computer matches '{query}' (searched {searched}).",
+                verified=True, verification_status="failed",
+                verification_details={"method": "local_media_search", "found": 0},
+            )
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        chosen = scored[0][2]
+        opened = self._execute_open_file(ToolCall(call_id=f"{action.call_id}-open", name="open_file", arguments={"path": str(chosen)}))
+        player = (opened.metadata or {}).get("process") or "the default player"
+        summary = f"Playing '{chosen.name}' in {player}." if opened.success else f"I found '{chosen.name}' but couldn't confirm the player opened."
+        return ToolResult(
+            call_id=action.call_id, name=action.action, success=opened.success, output=str(chosen),
+            human_readable=summary, error=None if opened.success else summary,
+            verified=opened.verified, verification_status=opened.verification_status,
+            verification_details={"method": "local_media_open", "path": str(chosen), "match": round(scored[0][0], 2),
+                                  "alternatives": [p.name for _s, _l, p in scored[1:4]], **dict(opened.verification_details or {})},
+            metadata={"path": str(chosen), "resolved_path": str(chosen), **dict(opened.metadata or {})},
+        )

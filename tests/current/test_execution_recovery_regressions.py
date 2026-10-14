@@ -77,6 +77,7 @@ def make_open_app_session(responses, memory=None):
         tool_guard=guard,
         memory=memory,
     )
+    session.local_intents_enabled = False  # exercises the model loop
     return session, engine
 
 
@@ -348,6 +349,7 @@ def test_email_draft_state_supports_body_edit_and_send_followup():
     guard = ToolGuard(tools)
     runner = ToolRunner(ExecutionEngine(registry=registry), guard, tools)
     session = AgentSession([SequenceProvider([])], tool_registry=tools, tool_runner=runner, tool_guard=guard)
+    session.local_intents_enabled = False  # exercises the model loop
 
     created = session._run_tool(ToolCall("c1", "email_draft_create", {"to": "person@example.com", "subject": "Test", "body": "old body"}))
     assert created.success and created.verified
@@ -395,6 +397,7 @@ def test_email_draft_read_followup_is_local_and_speech_friendly():
     guard = ToolGuard(tools)
     runner = ToolRunner(ExecutionEngine(registry=registry), guard, tools)
     session = AgentSession([SequenceProvider([])], tool_registry=tools, tool_runner=runner, tool_guard=guard)
+    session.local_intents_enabled = False  # exercises the model loop
     session._last_email_draft = {"draft_id": "d2", "to": "person@example.com", "subject": "Hello", "body": "old"}
 
     response = session._handle_local_email_draft_followup("read out the email")
@@ -563,6 +566,8 @@ def test_desktop_context_application_session_is_identity_aware():
 
 def test_application_window_matching_does_not_accept_partial_title_for_launch(monkeypatch):
     capability = DesktopCapability()
+    # Hermetic: no real WhatsApp process windows (process identity is checked first).
+    monkeypatch.setattr(capability, "_find_windows_for_process", lambda pid: [])
     monkeypatch.setattr(capability, "_find_window_candidates", lambda target, exact_only=False: [99] if exact_only and target.casefold() == "whatsapp" else [])
     assert capability._find_existing_application_window("WhatsApp", None) == 99
 

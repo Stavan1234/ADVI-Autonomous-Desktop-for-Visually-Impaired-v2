@@ -25,6 +25,25 @@ from advi.environment import get_environment_paths
 
 logger = logging.getLogger(__name__)
 
+# Process identities for apps whose Start menu entry carries no executable.
+_KNOWN_APP_PROCESSES: dict[str, tuple[str, ...]] = {
+    "telegram": ("Telegram.exe",),
+    "whatsapp": ("WhatsApp.Root.exe", "WhatsApp.exe"),
+    "spotify": ("Spotify.exe",),
+    "settings": ("SystemSettings.exe",),
+    "calculator": ("CalculatorApp.exe",),
+    "teams": ("ms-teams.exe", "Teams.exe"),
+    "outlook": ("olk.exe", "OUTLOOK.EXE"),
+    "photos": ("Photos.exe",),
+    "notepad": ("Notepad.exe",),
+    "paint": ("mspaint.exe",),
+    # Office titles read "Excel (Product Activation Failed)" on this PC.
+    "word": ("WINWORD.EXE",),
+    "excel": ("EXCEL.EXE",),
+    "powerpoint": ("POWERPNT.EXE",),
+    "onenote": ("ONENOTE.EXE",),
+}
+
 
 class DesktopCapability:
     """
@@ -91,7 +110,39 @@ class DesktopCapability:
     # -------------------------------------------------------------
     # Window & Application Launching
     # -------------------------------------------------------------
+    # Office on this PC shows "Microsoft Office Activation Wizard" a few seconds
+    # after it starts; it blocked closing Word ("You cannot close Microsoft Word
+    # because a dialog box is open") and any work in the app.
     def _execute_open_application(self, action: ToolCall) -> ToolResult:
+        result = self._open_application(action)
+        if result.success and self._is_office(action):
+            from advi.capabilities.office import nags
+
+            nags.watch_in_background()
+        return result
+
+    def _execute_close_application(self, action: ToolCall) -> ToolResult:
+        if not self._is_office(action):
+            return self._close_application(action)
+        from advi.capabilities.office import nags
+
+        cleared = nags.dismiss_once()
+        if cleared:
+            time.sleep(0.8)
+        result = self._close_application(action)
+        if not result.success and nags.dismiss_once():
+            time.sleep(0.8)
+            result = self._close_application(action)
+        return result
+
+    @staticmethod
+    def _is_office(action: ToolCall) -> bool:
+        from advi.capabilities.office import nags
+
+        name = action.parameters.get("application") or action.parameters.get("app") or action.parameters.get("name") or action.target
+        return os.name == "nt" and nags.is_office_app(str(name or ""))
+
+    def _open_application(self, action: ToolCall) -> ToolResult:
         app_name = action.parameters.get("application") or action.target or ""
         app_clean = str(app_name).strip()
         if not app_clean:
@@ -307,7 +358,7 @@ class DesktopCapability:
                     return last
 
                 signature = self._readiness_signature(int(hwnd))
-                if visible and focused:
+                if visible:
                     if signature == last_signature:
                         stable_samples += 1
                     else:
@@ -317,7 +368,12 @@ class DesktopCapability:
                     # Two identical UI samples are enough when UIA is available;
                     # if UIA cannot enumerate controls, require a small settle period
                     # after the window becomes visible instead of waiting indefinitely.
-                    stable = stable_samples >= 2 if signature is not None else elapsed_visible >= 0.75
+                    stable = (focused and stable_samples >= 2) if signature is not None else (focused and elapsed_visible >= 0.75)
+                    # Some apps never hold an identical UI sample (Windows 11 Notepad),
+                    # and Windows can refuse focus to a background process. A window
+                    # visible for 2.5 s with no blocking dialog is usable; reporting
+                    # it as "still loading" stalled tasks (runtime log).
+                    stable = stable or elapsed_visible >= 2.5
                     if stable:
                         session.bind_window(
                             hwnd=int(hwnd),
@@ -627,6 +683,15 @@ class DesktopCapability:
         exact_title = title_norm == req_norm
         prefix_title = title_norm.startswith(req_norm + " - ") or title_norm.startswith(req_norm + " | ")
 
+        # Process identity beats titles: Win11 Notepad is "Untitled - Notepad" and
+        # Telegram is "Telegram (16372)"; both failed the title check and every
+        # "open notepad" waited 12 s and reported "still loading".
+        known = _KNOWN_APP_PROCESSES.get(req_norm.removeprefix("microsoft "))
+        if process and known and process in {name.casefold() for name in known}:
+            return True
+        if process and process.removesuffix(".exe") == req_norm.replace(" ", ""):
+            return True
+
         if runtime_type == "packaged":
             # Office windows/documents are never a valid identity for packaged apps,
             # even when the document title is exactly the requested app name.
@@ -794,9 +859,12 @@ class DesktopCapability:
                 metadata={"path": str(target_path), "resolved_path": str(target_path), "dialog_hwnd": dialog_hwnd},
             )
 
-        filename_control = self._find_dialog_edit(dialog, preferred_titles=("File name:", "File name"))
-        if filename_control is None:
-            filename_control = self._find_first_dialog_edit(dialog)
+        # The common file dialog's filename box has the stable control ID 1001.
+        # Its file list exposes every Name/Type/Size cell as an Edit too, so a
+        # "first edit" fallback would type into the list instead.
+        filename_control = self._find_dialog_edit_by_id(dialog, "1001") or self._find_dialog_edit(
+            dialog, preferred_titles=("File name:", "File name")
+        )
         save_button = self._find_dialog_button(dialog, titles=("Save", "&Save"))
         if filename_control is None or save_button is None:
             controls = self._dialog_control_summary(int(dialog_hwnd))
@@ -814,21 +882,23 @@ class DesktopCapability:
             current = self._dialog_edit_value(filename_control)
             return current is not None and current.strip().casefold() == str(target_path).casefold()
 
-        try:
-            filename_control.set_edit_text(str(target_path))
-        except Exception:
-            pass
-        if not filename_matches():
-            try:
-                from pywinauto import keyboard as _keyboard
+        # Verified live (Notepad, 2026-10-14): set_edit_text changes the box's
+        # text but not the dialog's own filename, so it saved "Untitled.txt".
+        # Real keystrokes update both. Type, read back, retry once.
+        from pywinauto import keyboard as _keyboard
 
+        escaped = "".join("{%s}" % ch if ch in "{}+^%~()" else ch for ch in str(target_path))
+        for _attempt in range(2):
+            try:
                 filename_control.click_input()
-                pyautogui.hotkey("ctrl", "a")
-                escaped = "".join("{%s}" % ch if ch in "{}+^%~()" else ch for ch in str(target_path))
-                _keyboard.send_keys(escaped, with_spaces=True, pause=0.01)
-                time.sleep(0.2)
+                time.sleep(0.15)
+                _keyboard.send_keys("^a{BACKSPACE}")
+                _keyboard.send_keys(escaped, with_spaces=True, pause=0.005)
+                time.sleep(0.25)
             except Exception:
-                pass
+                logger.debug("Typing the Save As filename failed", exc_info=True)
+            if filename_matches():
+                break
         if not filename_matches():
             try:
                 pyautogui.press("esc")
@@ -938,6 +1008,16 @@ class DesktopCapability:
                 candidate = dialog.child_window(title=title, control_type="Edit")
                 if candidate.exists(timeout=0.15):
                     return candidate
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _find_dialog_edit_by_id(dialog: Any, automation_id: str) -> Any | None:
+        try:
+            for edit in dialog.descendants(control_type="Edit"):
+                if str(edit.element_info.automation_id) == automation_id:
+                    return edit
         except Exception:
             pass
         return None
@@ -1448,7 +1528,31 @@ class DesktopCapability:
             verification_details=detail, metadata=detail,
         )
 
-    def _execute_close_application(self, action: ToolCall) -> ToolResult:
+    @staticmethod
+    def _windows_titled_for_app(application: str) -> list[int]:
+        """Visible top-level windows titled "<anything> - <application>" (Windows' standard form)."""
+        if os.name != "nt":
+            return []
+        import ctypes.wintypes as wt
+
+        user32 = ctypes.windll.user32
+        suffix = f" - {application}".casefold()
+        found: list[int] = []
+        proc = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
+
+        def callback(hwnd, _lparam):
+            if user32.IsWindowVisible(hwnd) and not user32.GetWindow(hwnd, 4):  # skip owned popups
+                buffer = ctypes.create_unicode_buffer(512)
+                user32.GetWindowTextW(hwnd, buffer, 512)
+                title = buffer.value.strip().lstrip("*").casefold()
+                if title.endswith(suffix) or title == application.casefold():
+                    found.append(int(hwnd))
+            return True
+
+        user32.EnumWindows(proc(callback), 0)
+        return found
+
+    def _close_application(self, action: ToolCall) -> ToolResult:
         """Gracefully close all visible top-level windows belonging to one app."""
         application = str(action.parameters.get("application") or action.parameters.get("app") or action.parameters.get("name") or action.target or "").strip()
         if not application:
@@ -1469,6 +1573,17 @@ class DesktopCapability:
             hwnds.extend(self._find_window_candidates(str(record.name), exact_only=True))
         if not hwnds:
             hwnds.extend(self._find_window_candidates(application, exact_only=True))
+        if not hwnds:
+            # Packaged apps (Windows 11 Notepad) have no executable path, and their
+            # titles read "<document> - Notepad", so the exact-title lookup above
+            # found nothing (runtime log: close_application failed on Word too).
+            try:
+                found = self._find_existing_application_window(application, record)
+            except Exception:
+                found = None
+            if found:
+                hwnds.append(int(found))
+            hwnds.extend(self._windows_titled_for_app(application))
         hwnds = list(dict.fromkeys(int(h) for h in hwnds if h))
 
         # If the app is discoverable but has no visible window, do not terminate
@@ -2762,6 +2877,14 @@ class DesktopCapability:
             if Path(raw).name:
                 process_names.append(Path(raw).name)
 
+        # Store apps often expose only an AppID (launched through explorer.exe),
+        # so a running Telegram (window "Telegram (16372)" with its unread
+        # count) was never recognised and "open telegram" failed after 12-25 s.
+        if not process_names:
+            known = _KNOWN_APP_PROCESSES.get(re.sub(r"^microsoft\s+", "", application.strip().casefold()))
+            if known:
+                process_names.extend(known)
+
         # Some Start Apps records identify classic desktop apps with an AppID
         # but omit the executable. Reuse the same canonical launch resolver used
         # for starting the app so an already-running Word/Excel/etc. instance can
@@ -2812,6 +2935,11 @@ class DesktopCapability:
                 return foreground
             if len(candidates) == 1:
                 return candidates[0]
+            # Several windows of the same app (two Telegram instances, several
+            # Word documents): "open X" means its most recently used window.
+            topmost = self._topmost_of(candidates)
+            if topmost:
+                return topmost
 
         # Application-title matching is exact-only at launch time. A fuzzy title
         # is appropriate for explicit "focus the Word window" requests, but is
@@ -2827,6 +2955,27 @@ class DesktopCapability:
             if len(exact) == 1:
                 return exact[0]
         return None
+
+    @staticmethod
+    def _topmost_of(hwnds: list[int]) -> int | None:
+        """The first of ``hwnds`` in Z-order (EnumWindows walks top to bottom)."""
+        if os.name != "nt" or not hwnds:
+            return None
+        wanted = {int(h) for h in hwnds}
+        found: list[int] = []
+        EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        def callback(hwnd, _lparam):
+            if int(hwnd or 0) in wanted:
+                found.append(int(hwnd))
+                return False
+            return True
+
+        try:
+            ctypes.windll.user32.EnumWindows(EnumWindowsProc(callback), 0)
+        except Exception:
+            return None
+        return found[0] if found else None
 
     @staticmethod
     def _find_window_by_pid(pid: int) -> int | None:

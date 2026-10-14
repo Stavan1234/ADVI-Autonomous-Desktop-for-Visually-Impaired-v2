@@ -96,6 +96,14 @@ class GeminiProvider(LLMProvider):
                 retry_options=types.HttpRetryOptions(attempts=1),
             )
             client = genai.Client(api_key=api_key, http_options=http_options)
+            # Measured 2026-10-14: interactions.create hung past every timeout
+            # (100 s+) when the key's quota was exhausted, while the plain
+            # request path reported "daily quota exhausted" in 0.5 s. ADVI then
+            # waited 20 s per turn and never learned the real reason. The
+            # stateless path is the default; opt in with ADVI_GEMINI_INTERACTIONS=1.
+            self._native_enabled = os.environ.get("ADVI_GEMINI_INTERACTIONS", "").strip() == "1"
+        else:
+            self._native_enabled = True
 
         self._client = client
         self._model = model
@@ -450,6 +458,8 @@ class GeminiProvider(LLMProvider):
         A bounded handoff is carried as a data-only user input on the first
         interaction after provider switching.
         """
+        if not getattr(self, "_native_enabled", True):
+            return None
         interactions = getattr(self._client, "interactions", None)
         if interactions is None or not callable(getattr(interactions, "create", None)):
             return None

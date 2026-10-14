@@ -133,6 +133,14 @@ ACTION_CONTRACTS: dict[str, ActionContract] = {
         "slides": ParameterRule(kind="integer", description="Optional requested slide count for generated PPTX files."),
         "style": ParameterRule(description="Optional visual style for generated documents, e.g. polished, colorful, modern, academic."),
     }, True),
+    "word_create_document": ActionContract("word_create_document", {
+        "path": ParameterRule(required=True, aliases=("filename", "file", "save_as", "location"),
+                              description="Where to save, e.g. desktop/Speech.docx or documents/Report.pdf."),
+        "content": ParameterRule(required=True, aliases=("text", "body", "value"),
+                                 description="The complete document text with # / ## headings, - bullets, 1. lists, | tables |, > quotes, **bold**."),
+        "title": ParameterRule(description="Optional document title if content has no leading # heading."),
+        "open": ParameterRule(kind="boolean", description="Open the saved document in Word afterwards (default true)."),
+    }, True),
     "append_file": ActionContract("append_file", {"path": ParameterRule(required=True, aliases=("filename",)), "content": ParameterRule(required=True, aliases=("value",))}, True),
     "replace_file_text": ActionContract("replace_file_text", {"path": ParameterRule(required=True, aliases=("filename",)), "old_text": ParameterRule(required=True, aliases=("old", "find")), "new_text": ParameterRule(required=True, aliases=("new", "replace", "value"))}, True),
     "read_file": ActionContract("read_file", {
@@ -178,6 +186,31 @@ ACTION_CONTRACTS: dict[str, ActionContract] = {
     # Send accepts either an existing draft_id or a complete message.
     # Conditional validation (draft_id OR to+subject+body) is enforced by the
     # Gmail capability rather than pretending the schema can express it directly.
+    "media_control": ActionContract(
+        "media_control",
+        {"action": ParameterRule(required=True, aliases=("command", "op"), description="pause, resume, next, previous, volume_up, volume_down or mute.")},
+    ),
+    "play_local_media": ActionContract(
+        "play_local_media",
+        {
+            "query": ParameterRule(required=True, aliases=("name", "title", "song", "video"), description="Words from the file's title."),
+            "folder": ParameterRule(aliases=("path",), description="Optional folder to search first."),
+        },
+    ),
+    "move_files": ActionContract(
+        "move_files",
+        {
+            "source": ParameterRule(required=True, aliases=("from", "source_folder"), description="Folder to move files out of (e.g. Downloads)."),
+            "destination": ParameterRule(required=True, aliases=("to", "destination_folder", "target"), description="Folder to move them into; created if missing."),
+            "extensions": ParameterRule(kind="list_or_string", aliases=("extension", "types"), description="Only these extensions, e.g. ['pdf']; omit for all files."),
+            "name_contains": ParameterRule(description="Only files whose name contains this text."),
+        },
+    ),
+    "organize_folder": ActionContract(
+        "organize_folder",
+        {"folder": ParameterRule(required=True, aliases=("path", "directory"), description="Folder whose loose files to sort into Documents/Images/Videos/Audio/Archives/Installers.")},
+    ),
+    "undo_file_operation": ActionContract("undo_file_operation"),
     "observe_window": ActionContract(
         "observe_window",
         {
@@ -216,6 +249,22 @@ ACTION_CONTRACTS: dict[str, ActionContract] = {
         {
             "chat": ParameterRule(required=True, aliases=("contact", "name", "recipient", "to", "group"),
                                   description="Exact WhatsApp chat or group name as the user said it."),
+        },
+    ),
+    "telegram_send_message": ActionContract(
+        "telegram_send_message",
+        {
+            "chat": ParameterRule(required=True, aliases=("contact", "name", "recipient", "to", "group", "channel"),
+                                  description="Exact Telegram chat, group or channel name as the user said it."),
+            "text": ParameterRule(required=True, aliases=("message", "body", "content"),
+                                  description="Exact message text to send, as the user dictated it."),
+        },
+    ),
+    "telegram_open_chat": ActionContract(
+        "telegram_open_chat",
+        {
+            "chat": ParameterRule(required=True, aliases=("contact", "name", "recipient", "to", "group", "channel"),
+                                  description="Exact Telegram chat, group or channel name as the user said it."),
         },
     ),
     "email_send": ActionContract(

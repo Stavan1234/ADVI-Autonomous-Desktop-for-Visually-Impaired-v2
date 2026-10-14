@@ -62,7 +62,7 @@ def test_verified_play_media_completes_a_media_task():
 
 
 def _routed(text):
-    names = ["navigate", "search", "inspect_web_page", "click_web_element", "play_media",
+    names = ["navigate", "search", "inspect_web_page", "click_web_element", "play_media", "play_local_media",
              "find_file", "list_files", "open_file", "whatsapp_send_message"]
     caps = {"find_file": "file_management", "list_files": "file_management", "open_file": "file_management",
             "whatsapp_send_message": "messaging"}
@@ -72,12 +72,16 @@ def _routed(text):
     return {t["function"]["name"] for t in session._select_model_tools(text)}
 
 
-def test_play_requests_route_to_play_media_only():
-    assert _routed("play praise song on youtube") == {"play_media"}
-    assert _routed("play Overflow by Transformation Worship on YouTube Music") == {"play_media"}
+def test_play_requests_offer_online_and_local_players():
+    assert _routed("play praise song on youtube") == {"play_media", "play_local_media"}
+    assert _routed("play Overflow by Transformation Worship on YouTube Music") == {"play_media", "play_local_media"}
+    # Log 2026-10-14: the user meant the video in their Videos folder.
+    local = _routed("play here i am to worship video from my videos folder")
+    assert "play_local_media" in local and "play_media" not in local
 
 
 def test_local_files_other_sites_and_whatsapp_are_not_rerouted():
     assert "play_media" not in _routed("play any audio from my music folder")
+    assert "play_local_media" in _routed("play any audio from my music folder")
     assert "play_media" not in _routed("open chrome, go to Miruro.to and play the first episode")
     assert "play_media" not in _routed("tell Joel on whatsapp let's play tonight")

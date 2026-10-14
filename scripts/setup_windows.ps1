@@ -62,10 +62,20 @@ if ($allPiperAssetsPresent) {
 }
 
 $tesseract = Get-Command tesseract -ErrorAction SilentlyContinue
-if ($tesseract) {
+$tesseractPaths = @("$env:ProgramFiles\Tesseract-OCR\tesseract.exe", "${env:ProgramFiles(x86)}\Tesseract-OCR\tesseract.exe", "$env:LOCALAPPDATA\Programs\Tesseract-OCR\tesseract.exe")
+if ($tesseract -or ($tesseractPaths | Where-Object { $_ -and (Test-Path $_) })) {
     Write-Host "Tesseract OCR: FOUND" -ForegroundColor Green
 } else {
-    Write-Host "Tesseract OCR: NOT FOUND (visual OCR fallback will report unavailable until installed)." -ForegroundColor Yellow
+    Write-Host "Tesseract OCR: NOT FOUND. Telegram messages and screen reading need it:" -ForegroundColor Yellow
+    Write-Host "    winget install UB-Mannheim.TesseractOCR" -ForegroundColor Yellow
+}
+
+$chromePaths = @("$env:ProgramFiles\Google\Chrome\Application\chrome.exe", "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe", "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe")
+if ($chromePaths | Where-Object { $_ -and (Test-Path $_) }) {
+    Write-Host "Google Chrome: FOUND" -ForegroundColor Green
+} else {
+    Write-Host "Google Chrome: NOT FOUND. Websites, YouTube and David Gmail need it:" -ForegroundColor Yellow
+    Write-Host "    winget install Google.Chrome" -ForegroundColor Yellow
 }
 
 Write-Host "Running local source validation..." -ForegroundColor Yellow
@@ -73,10 +83,12 @@ Write-Host "Running local source validation..." -ForegroundColor Yellow
 if ($LASTEXITCODE -ne 0) { throw "Source compilation failed." }
 
 Write-Host "Running the current ADVI regression suite..." -ForegroundColor Yellow
-& $venvPython -m pytest -q
+# test_groq_smoke.py calls the real Groq API; it is skipped here so a missing or
+# not-yet-added key cannot fail the installation.
+& $venvPython -m pytest -q --deselect tests/current/test_groq_smoke.py
 if ($LASTEXITCODE -ne 0) { throw "ADVI regression tests failed. Fix the failing test(s) before using the installation." }
 
 Write-Host "" 
 Write-Host "ADVI installation and source validation complete." -ForegroundColor Green
 Write-Host "Edit .env, then run .\run_advi.bat" -ForegroundColor Cyan
-Write-Host "Before real desktop/Gmail use, run .\scripts\smoke_windows.ps1 and follow docs\WINDOWS_VALIDATION.md" -ForegroundColor Cyan
+Write-Host "See README.md for things to try." -ForegroundColor Cyan

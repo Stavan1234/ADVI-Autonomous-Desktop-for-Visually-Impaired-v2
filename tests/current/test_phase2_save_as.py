@@ -25,8 +25,7 @@ class FakeEdit:
         self.value = "Whispers of dawn in quiet light,.txt"
 
     def set_edit_text(self, text):
-        if self.accepts:
-            self.value = text
+        pass  # the real dialog ignores this for its filename (verified live)
 
     def click_input(self):
         pass
@@ -48,10 +47,18 @@ class FakeButton:
 def _capability(monkeypatch, *, accepts, writes_file, target, title):
     gui = FakePyAutoGUI()
     monkeypatch.setattr("advi.capabilities.desktop.executor._get_pyautogui", lambda: gui)
-    monkeypatch.setattr("pywinauto.keyboard.send_keys", lambda *a, **k: None)
+    typed = {}
+
+    def send_keys(keys, *args, **kwargs):
+        # Like the real dialog: only typed text reaches the filename box.
+        if edit.accepts and not keys.startswith("^a") and keys not in ("{ENTER}", "{ESC}"):
+            edit.value = keys.replace("{(}", "(").replace("{)}", ")")
+        typed["last"] = keys
+
+    monkeypatch.setattr("pywinauto.keyboard.send_keys", send_keys)
+    edit = FakeEdit(accepts)
     cap = DesktopCapability(context=DesktopContext(current_application="Notepad"))
     cap.context.target_hwnd = 5
-    edit = FakeEdit(accepts)
     button = FakeButton(lambda: target.write_text("poem") if writes_file else None)
     monkeypatch.setattr(cap, "_ensure_target_window", lambda **kwargs: (True, {}))
     monkeypatch.setattr(cap, "_find_foreground_dialog_for_pid", lambda pid: 99)

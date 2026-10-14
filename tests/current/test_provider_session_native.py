@@ -517,6 +517,7 @@ def test_task_lifecycle_keeps_terminal_truth_on_provider_error():
         tool_runner=ToolRunner(FakeEngine(), ToolGuard(tool_registry), tool_registry),
         tool_guard=ToolGuard(tool_registry),
     )
+    session.local_intents_enabled = False  # exercises the model loop
 
     resp = session.respond("Open Notepad")
     assert "completed and verified" in resp.text.lower()
@@ -583,6 +584,7 @@ def test_task_lifecycle_transitions_to_uncertain_when_external_effect_unconfirme
         tool_runner=ToolRunner(FakeEngine(), ToolGuard(tool_registry), tool_registry),
         tool_guard=ToolGuard(tool_registry),
     )
+    session.local_intents_enabled = False  # exercises the model loop
 
     resp = session.respond("Open Notepad")
     assert "I couldn't continue that task just now" in resp.text
