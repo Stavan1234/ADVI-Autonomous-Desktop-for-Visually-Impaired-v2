@@ -1,0 +1,55 @@
+ADVI 0.3.4 - START HERE
+=======================
+
+THIS ZIP IS THE COMPLETE ADVI PROJECT.
+
+1. Extract this ZIP to a normal folder, for example:
+   C:\ADVI
+
+2. Run:
+   SETUP_ADVI.bat
+
+   This creates .venv, installs the Python dependencies, creates .env from
+   .env.example, and performs source compilation plus the current regression test suite.
+
+3. Open:
+   .env
+
+   Put at least one supported LLM API key there.
+
+4. Optional Groq failover:
+   Put GROQ_API_KEY, GROQ_API_KEY_2, and GROQ_API_KEY_3 in .env. ADVI will rotate
+   through healthy keys automatically. Use GROQ_KEY_GROUPS when keys share a quota scope.
+
+5. Start ADVI:
+   run_advi.bat
+
+6. Optional Windows capability check:
+   scripts\smoke_windows.ps1
+
+7. Gmail (optional):
+   Put your own OAuth client file at:
+   credentials\gmail_credentials.json
+
+8. OCR:
+   pytesseract is included. A Windows Tesseract installation is needed for
+   local OCR. The exact executable can be configured with the normal ADVI
+   environment settings described in the documentation.
+
+9. Speech:
+   Piper assets are NOT bundled in this source archive. ADVI can fall back to
+   Windows built-in speech output when Piper is unavailable.
+
+IMPORTANT
+---------
+This archive intentionally does NOT contain your personal .env file, Gmail
+OAuth tokens/credentials, runtime database, logs, caches, or other machine
+state. You must supply your own provider keys and optional Gmail credentials.
+
+Read SETUP_WINDOWS.md for the complete setup reference.
+
+
+MCP (optional)
+--------------
+Copy mcp_servers.json.example to mcp_servers.json and configure your MCP servers.
+ADVI exposes MCP only when a turn explicitly requests MCP/external tools.

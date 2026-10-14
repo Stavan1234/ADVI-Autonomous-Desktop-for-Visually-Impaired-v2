@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "local_example": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:\\Users\\YOUR_NAME\\Documents"]
+    },
+    "remote_example": {
+      "transport": "streamable_http",
+      "url": "http://127.0.0.1:8000/mcp"
+    }
+  }
+}

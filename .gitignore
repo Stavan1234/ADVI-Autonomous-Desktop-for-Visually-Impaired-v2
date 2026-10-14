@@ -1,0 +1,26 @@
+# Local environments
+.venv/
+
+# Secrets / local credentials
+.env
+credentials/
+
+# Runtime state
+runtime/
+logs/
+
+# Python caches / test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.whl
+
+# Local MCP server configuration may contain credentials and machine paths.
+mcp_servers.json
