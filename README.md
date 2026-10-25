@@ -1,250 +1,257 @@
 # ADVI: Autonomous Desktop for the Visually Impaired
 
-ADVI is a voice-first assistant for Windows. You type (or dictate) what you want in plain English and ADVI
-does it on the computer and speaks the result. For example, it can open apps and websites, play music,
-write Word documents, manage files, and send WhatsApp, Telegram or Gmail messages.
+ADVI is a voice assistant for Windows, built for people who can't see the screen. You say (or type) what you
+want in plain English. ADVI does it on the computer and tells you the result out loud. For example:
 
-An AI model (Groq or Google Gemini) understands the request. ADVI's own code does the work on the computer
-and **checks that it really happened** before saying "done". Anything that sends a message or email always
-asks you first.
+> "Wake up ADVI." … "Send hello to Mom on WhatsApp." … "Write a short speech on courage in Word and save it
+> on the desktop." … "Play Believer on YouTube." … "Organize my downloads." … "Is the internet connected?"
+
+**How ADVI works:**
+- An AI model (Groq or Google Gemini) understands the request.
+- ADVI's own code does the work on the computer and **checks that it really happened** before saying "done".
+- Anything that sends a message or email, or deletes mail, **always asks you first**.
+
+**Contents**
+1. [Quick start](#1-quick-start)
+2. [Already have ADVI? Updating](#2-already-have-advi-updating)
+3. [What you need](#3-what-you-need)
+4. [Using ADVI by voice](#4-using-advi-by-voice)
+5. [Things to try](#5-things-to-try)
+6. [Safety and privacy](#6-safety-and-privacy)
+7. [When the AI is unavailable](#7-when-the-ai-is-unavailable)
+8. [Troubleshooting](#8-troubleshooting)
+9. [Working on ADVI as a team](#9-working-on-advi-as-a-team)
 
 ---
 
-## 1. What you need
+## 1. Quick start
 
-| Requirement | Why | Get it |
-|---|---|---|
-| Windows 10/11, 64-bit | ADVI controls Windows apps | Not applicable |
-| **Python 3.13** (64-bit) | Runs ADVI | [python.org/downloads](https://www.python.org/downloads/). Tick **"Add python.exe to PATH"** and keep **"py launcher"** selected |
-| **Google Chrome** | Websites, YouTube, Gmail through the browser | `winget install Google.Chrome` |
-| **A free AI key** (at least one) | The "brain" | Groq: [console.groq.com/keys](https://console.groq.com/keys). Gemini: [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
-| Tesseract OCR *(recommended)* | Telegram messages, reading the screen | `winget install UB-Mannheim.TesseractOCR` |
-| Microsoft Office *(optional)* | Writing Word documents | Works even when Office shows "Product Activation Failed" |
-| WhatsApp / Telegram Desktop *(optional)* | Messaging | Microsoft Store; sign in once |
-| Microphone and speakers *(optional)* | Talking to ADVI | Allow desktop apps to use the microphone in Windows privacy settings |
+About 10–20 minutes the first time, mostly downloads.
 
-## 2. Install (about 10–20 minutes, mostly downloads)
+1. **Install Python 3.13 (64-bit) and Google Chrome.** See [section 3](#3-what-you-need).
+2. **Get the code into a short folder,** for example `C:\ADVI`:
+   ```powershell
+   git clone https://github.com/Stavan1234/ADVI-Autonomous-Desktop-for-Visually-Impaired-v2.git C:\ADVI
+   ```
+   - Keep the path short. Windows limits file paths, and one of ADVI's packages (PyTorch) needs the folder
+     path to stay under about 100 characters.
+   - A ZIP extracted inside Downloads is usually too long. Setup checks this and tells you what to do.
+3. **Double-click `SETUP_ADVI.bat`.** It:
+   - creates a private Python environment (`.venv`) and installs everything;
+   - creates your `.env` settings file;
+   - downloads the offline speech and wake-word models (about 400 MB);
+   - runs the test suite (about 970 tests);
+   - turns on the wake word.
 
-1. Download or clone this folder to a **short path**, for example `C:\ADVI`.
-   Windows limits file paths to 260 characters, and one of ADVI's packages (PyTorch) needs the folder path to
-   stay under about 100 characters. A GitHub ZIP extracted into Downloads is too long; setup tells you if so.
-2. Double-click **`SETUP_ADVI.bat`**.
-   It creates a private Python environment (`.venv`), installs everything, creates your `.env` file,
-   downloads the offline speech model (about 320 MB), and runs the test suite. At the end it tells you
-   whether Tesseract and Chrome were found.
-3. Open **`.env`** in Notepad and paste your key(s):
+   It ends with `SETUP COMPLETE`, or with a clear message saying what to fix.
+4. **Add an AI key.** Open `.env` in Notepad and paste at least one key:
    ```text
    GROQ_API_KEY=gsk_your_key_here
    GEMINI_API_KEY=your_gemini_key_here
    ```
-   One key is enough. Having both Groq and Gemini means ADVI can switch when one runs out.
-4. Double-click **`run_advi.bat`**. When ADVI says *"Everything is ready"*, type a request and press Enter.
-   Type `exit` to quit.
+   - Both are free:
+     - Groq: [console.groq.com/keys](https://console.groq.com/keys);
+     - Gemini: [aistudio.google.com/apikey](https://aistudio.google.com/apikey).
+   - One key is enough. With both, ADVI switches automatically when one runs out.
+   - **Never commit or share `.env`.** Each person uses their own keys.
+5. **Start ADVI:** double-click `run_advi.bat`, or just say **"wake up ADVI"**.
+   - ADVI says *"Just preparing everything…"*, then *"Everything is ready, sir. I'm listening…"* (about
+     10–20 seconds, longer on the very first start).
+   - Then talk to it, or type in its window.
+6. **First-time sign-ins**, each once:
+   - **Chrome:** ADVI uses its **own** Chrome profile and never touches your personal one. The first time it
+     opens Chrome, sign in to Gmail and YouTube in that window.
+   - **WhatsApp / Telegram Desktop:** open the app and sign in.
+   - **Gmail through the Google API** (optional, more reliable than the browser): see
+     [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#3-configure). Without it, ADVI uses Gmail in Chrome.
 
-> **Free-tier tip:** free AI keys have a daily limit. Extra Groq keys only help if they come from
-> **different Groq accounts**; keys from the same account share one quota. When every key is used up, ADVI
-> still runs simple commands without AI (see section 5).
+To close ADVI, say or type **"sleep"** or **"exit"**. To bring it back, say **"wake up ADVI"**.
 
-### First-time sign-ins
+## 2. Already have ADVI? Updating
 
-- **Browser:** ADVI uses its own Chrome profile, so it never touches your personal Chrome. The first time it
-  opens Chrome, sign in to Gmail and YouTube in that window once.
-- **WhatsApp / Telegram:** open the desktop app and sign in once.
-- **Gmail through the Google API (optional):** put your OAuth client file at `credentials/gmail_credentials.json`.
-  Without it, ADVI sends Gmail through the browser instead ("David").
-
-## 3. Things to try
-
-Start simple, then mix them up. Phrase things naturally; the examples are only ideas.
-
-**Talking instead of typing.** ADVI listens from the moment it's ready. Just talk; no key is needed.
-- **ADVI's sounds** are all from one soft, bell-like family:
-  - **rising "ti-ting"**: I'm ready, your turn to talk;
-  - **tiny tick**: I can hear you speaking;
-  - **two falling notes**: got it, working on it;
-  - **slow, quiet breathing tone**: still working;
-  - **short falling notes**: stopped or interrupted;
-  - **two low notes**: I didn't catch that;
-  - **rising arpeggio**: ADVI is starting (after "wake up ADVI");
-  - **falling arpeggio**: going to sleep (ADVI closes).
-
-  Say "what do the sounds mean?" any time to hear each sound with its meaning. ADVI also plays this guide
-  once, the first time you use voice.
-- **Pauses are fine.** ADVI waits about a second before deciding you've finished. If you stop mid-sentence
-  ("send a message to Siyu saying…"), it keeps listening a moment longer for the rest.
-- **ADVI doesn't hear itself.** It removes its own voice from the microphone (echo cancellation, the same
-  technique as Chrome, Meet and phone assistants), so it never answers its own sentences.
-- **To interrupt ADVI while it's talking,** just talk: it stops the moment you start and listens to the rest.
-  "Stop", "be quiet" or "enough" make it simply stop. **Ctrl + Alt + Space** also stops it talking; if another
-  program already uses that key, ADVI picks **Ctrl + Alt + Z** (or Ctrl + Alt + Enter) and says which one.
-- **"Sleep"**, "exit", "quit" or "close ADVI" (spoken or typed) closes ADVI completely, even in the middle of a task.
-- **"Wake up ADVI"** (or "hey ADVI") starts ADVI again, even after a restart, with no key and no clicking. A small
-  background listener does this: setup turns it on, and it starts whenever you sign in to Windows. It
-  recognises the phrase on this computer only; nothing is sent online. While ADVI is closed, the key above also
-  starts it. ADVI takes about 10–20 seconds to be ready (longer just after the PC starts).
-  - Check it: `.venv\Scripts\python.exe -m advi.wake status`
-  - Turn it off: `.venv\Scripts\python.exe -m advi.wake uninstall` (and `ADVI_WAKE=off` in `.env`)
-  - It needs Windows to be signed in: nothing can listen at the password screen.
-- **While music or a video is playing,** plain media commands work ("pause", "next", "volume down"). For anything
-  else start with its name ("ADVI, …"), so song lyrics never become commands.
-- **While it's working on something,** say "stop" to cancel it. Long searches stop right away.
-- **To fix a name or message before it's sent,** just say so: "it's S I Y U, not C U", "send it to Siyu instead",
-  or "change the message to see you at 5". ADVI asks again before sending.
-- **If it can't find a chat,** it asks you to spell just the name. It remembers the right name next time, so if
-  "Siyu" is heard as "CU" again, it says "to Siyu (I heard 'CU')".
-- **Speech recognition:**
-  - Online, it uses Whisper Turbo on Groq (free, under a second).
-  - Without internet, or if Groq has a problem, it uses a Whisper model on this computer. It is about 2–3 seconds
-    per command, and ADVI tells you once that it may be a little slower.
-  - Ask "why are you slow?" and it explains, even offline.
-  - `ADVI_STT_CLOUD=off` keeps your voice on this computer only.
-- Typing keeps working at the same time. To change the keys, or turn voice or the wake word off, see
-  `ADVI_VOICE_HOTKEY`, `ADVI_VOICE` and `ADVI_WAKE` in `.env.example`.
-
-**Apps**
-- `open notepad`
-- `open notepad and type hello from advi`
-- `open calculator` and then `close calculator`
-- `open word`, `open excel`, `open settings`
-
-**Websites and music**
-- `open youtube`
-- `play believer by imagine dragons`
-- `pause`, `resume`, `next song`, `volume up`, `mute`
-- `play lofi on youtube music`
-- `search wireless earbuds on amazon`
-- `search iphone 15 on flipkart`
-- `look up mount everest on wikipedia`
-- `search python tips on reddit`
-- `show me pizza near me on google maps`
-- `open gmail`
-
-**Writing documents (Microsoft Word)**
-- `write a short speech on courage in word and save it on desktop`
-- `create a word document about healthy breakfast ideas with headings and a table, save it as a pdf in documents`
-- `make a word document with 5 study tips for exams and save it in documents/School`
-
-**Files**
-- `open my downloads folder`
-- `create a folder called Projects on desktop`
-- `organize my downloads` and then `undo`
-- `move all pdf files from downloads to a folder called PDF`
-- `find my resume`
-- `what files are on my desktop?`
-- `delete test.txt from desktop` (it goes to the Recycle Bin)
-
-**Messages and email.** ADVI always asks "Should I send it?" first; say `yes` or `no`.
-- `send hello to Mom on whatsapp`
-- `message Rahul on whatsapp saying see you at 5`
-- `send hi to Saved Messages on telegram`
-- `send an email to someone@example.com saying the meeting is at 5`
-- `send an email to someone@example.com using david fallback saying good evening` (Gmail through the browser)
-- `check my inbox`, `read my latest email`, `any unread emails?`
-- `reply to that email saying thanks`, `forward it to someone@example.com`
-- `delete that email` (goes to Trash for 30 days), `archive it`, `mark it as unread`, `star it`
-- To fix a word before sending: `it's ADVI, not Adri`, or `change the body to …`
-
-**Looking at the screen** (needs a Gemini key)
-- `what's on my screen?`
-- `is there an error on the screen?`
-- `describe the telegram window`
-- `what do you see in chrome?`
-
-**Questions and system**
-- `what can you do`
-- `what is my battery level`
-- `what time is it`
-- `tell me a joke`
-- `stop` (stops what is playing or running)
-- `cancel` (cancels the current task)
-
-## 4. Safety
-
-- **Messages and emails are never sent without your "yes".** Natural answers like "yes send it" or "sure" work.
-  "no", "don't send it" and "send it to someone else instead" never send.
-- **Deleting goes to the Recycle Bin**, never permanent. If the Recycle Bin isn't available, ADVI refuses
-  to delete.
-- **Bulk file moves can be undone:** say `undo`.
-- **Saving never overwrites** an existing file; ADVI adds "(2)" to the name instead.
-- **Buy, pay, submit and delete buttons on websites** need your confirmation before ADVI clicks them.
-- ADVI **never solves CAPTCHAs** or "prove you're human" pages; it tells you to do that yourself.
-- **Screenshots go to Google Gemini only when needed:** when you ask what is on screen, or (at most twice
-  per task) when ADVI is stuck and its normal tools can't see the app. Automatic looks send only the
-  window ADVI is working in. Turn this off with `ADVI_VISION=off` in `.env`.
-
-## 5. When the AI is unavailable
-
-ADVI always asks the AI first. If every AI key fails (daily quota used up, no internet, or a bad key), ADVI
-falls back to a small set of **built-in commands** that need no AI:
-
-- opening apps, websites and folders
-- searching a site
-- play, pause, skip and volume
-- organizing, moving and undoing files
-- WhatsApp, Telegram and email (still with confirmation)
-
-It tells you when it did this. Anything unclear or multi-step waits for the AI; ADVI never guesses.
-
-You can change this in `.env`:
-
-```text
-ADVI_LOCAL_COMMANDS=fallback   # default: built-in commands only when the AI is unavailable
-ADVI_LOCAL_COMMANDS=first      # built-in commands first (saves AI quota)
-ADVI_LOCAL_COMMANDS=off        # never use built-in commands
+```powershell
+git pull
 ```
 
-## 6. Troubleshooting
+Then start ADVI as usual (`run_advi.bat` or "wake up ADVI"). If the update needs new packages or models,
+ADVI installs them by itself:
+- it says *"ADVI was updated. Installing the new parts once…"*;
+- it takes a few minutes, then starts;
+- it happens only once per update, and later starts are not slowed down.
+
+Your `.env` and everything ADVI remembered are kept.
+
+**Updating from 0.3.x to 0.4.0** adds always-on voice, the wake word, and echo cancellation (ADVI no longer
+hears itself). The wake word is switched on during that first start. If you don't want it, put
+`ADVI_WAKE=off` in `.env` before starting. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for everything that
+changed.
+
+## 3. What you need
+
+| Requirement | Why | How to get it |
+|---|---|---|
+| Windows 10 or 11, 64-bit | ADVI controls Windows apps | |
+| **Python 3.13**, 64-bit | Runs ADVI | [python.org/downloads](https://www.python.org/downloads/). Keep **"py launcher"** selected |
+| **Google Chrome** | Websites, YouTube, Gmail in the browser | `winget install Google.Chrome` |
+| **An AI key** (at least one) | The "brain" | Groq or Gemini, both free (see above) |
+| Microphone and speakers | Talking to ADVI | Windows Settings > Privacy & security > Microphone > allow desktop apps |
+| Tesseract OCR *(recommended)* | Telegram, reading text on screen | `winget install UB-Mannheim.TesseractOCR` |
+| Microsoft Word *(optional)* | Word documents | Works even when Office shows "Product Activation Failed" |
+| WhatsApp / Telegram Desktop *(optional)* | Messaging | Microsoft Store; sign in once |
+
+**Disk space:** about 2 GB (the Python environment, about 1.5 GB, plus the speech models).
+
+## 4. Using ADVI by voice
+
+ADVI listens from the moment it's ready. **Just talk; no key is needed.**
+
+| You want to… | Do this |
+|---|---|
+| Start ADVI | Say **"wake up ADVI"** (or "hey ADVI"). It works after a restart too, once you're signed in to Windows |
+| Ask something | Just say it. ADVI waits about a second after you stop; if you pause mid-sentence ("send a message to Siyu saying…") it waits a little longer |
+| Interrupt ADVI | Just start talking: it pauses and listens. Say **"stop"** to make it stop. The hotkey (below) also stops it talking |
+| Cancel a running task | Say **"stop"** or **"cancel"** |
+| Fix a name or message before sending | "It's S I Y U, not C U", "send it to Siyu instead", "change the message to see you at 5". ADVI asks again |
+| Hear what the sounds mean | "What do the sounds mean?" |
+| Close ADVI | **"Sleep"**, "exit" or "close ADVI" (spoken or typed) |
+
+**ADVI's sounds** are all from one soft, bell-like family:
+
+| Sound | Meaning |
+|---|---|
+| rising "ti-ting" | I'm ready, your turn to talk |
+| tiny tick | I can hear you speaking |
+| two falling notes | got it, working on it |
+| slow, quiet breathing tone | still working |
+| short falling notes | stopped or interrupted |
+| two low notes | I didn't catch that, please say it again |
+| rising arpeggio | ADVI is starting ("wake up ADVI") |
+| falling arpeggio | going to sleep (ADVI closes) |
+
+**Good to know:**
+- **ADVI doesn't hear itself.** It removes its own voice from the microphone (echo cancellation, as in Chrome,
+  Meet and phone assistants). If a little of its voice still gets through, it notices and carries on talking.
+- **While music or a video plays,** plain media commands work ("pause", "next", "volume down"). For anything
+  else, start with its name ("ADVI, …"), so song lyrics never become commands.
+- **The hotkey** is Ctrl + Alt + Space, or Ctrl + Alt + Z if another program already uses that; ADVI says
+  which at startup. While ADVI runs, it stops ADVI talking. While ADVI is closed, it starts ADVI.
+- **Speech recognition** uses Whisper on Groq when online (under a second). Offline, it uses a model on this
+  computer (2–3 seconds; ADVI tells you once). `ADVI_STT_CLOUD=off` keeps your voice on this computer only.
+- **The wake word** is a small background program that starts at Windows sign-in. It recognises the phrase on
+  this computer only, and nothing is sent online. Check it with:
+  ```powershell
+  .venv\Scripts\python.exe -m advi.wake status
+  ```
+  Turn it off with `uninstall` instead of `status`, and set `ADVI_WAKE=off` in `.env`.
+- **Typing always works** too, at the same time as voice.
+
+## 5. Things to try
+
+Phrase things naturally; these are only ideas.
+
+| Area | Examples |
+|---|---|
+| Apps | "open notepad and type hello from ADVI" · "open calculator", then "close calculator" · "open word" |
+| Web and music | "play Believer by Imagine Dragons" · "pause" · "next song" · "volume up" · "search wireless earbuds on Amazon" · "look up Mount Everest on Wikipedia" |
+| Documents | "write a short speech on courage in Word and save it on desktop" · "make a Word document with a table of the months and save it as a PDF" · "make a PowerPoint about ADVI" |
+| Files | "what's in my downloads?" · "organize my downloads", then "undo" · "move all PDF files from downloads to a folder called PDF" · "find my resume" · "delete test.txt from desktop" (Recycle Bin) |
+| Messages (asks first) | "send hello to Mom on WhatsApp" · "message Rahul on WhatsApp saying see you at 5" · "send hi to Saved Messages on Telegram" |
+| Email (asks first) | "send an email to someone@example.com saying the meeting is at 5" · "check my inbox" · "any unread emails?" · "reply to that saying thanks" · "delete that email" (Trash) |
+| Screen (needs a Gemini key) | "what's on my screen?" · "is there an error on the screen?" |
+| Questions | "what can you do?" · "what time is it?" · "battery level" · "is the internet connected?" · "status of my laptop" |
+
+## 6. Safety and privacy
+
+**What ADVI will and won't do:**
+- **Messages and emails are never sent without your "yes".** "No", "don't send it" and corrections never
+  send.
+- **Deleting files goes to the Recycle Bin**, never permanently. Bulk moves can be undone ("undo"). Saving
+  never overwrites a file.
+- **Buy, pay, submit and delete buttons on websites** need your confirmation. ADVI never solves CAPTCHAs.
+- When you ask ADVI to close something, it closes only that, not other windows.
+
+**What leaves your computer:**
+- Your requests and the information ADVI needs to answer them go to the AI service (Groq or Gemini).
+- Your voice goes to Groq for transcription, unless `ADVI_STT_CLOUD=off`.
+- Screenshots go to Gemini only when you ask what's on screen, or at most twice per task when ADVI is stuck.
+  `ADVI_VISION=off` turns this off.
+
+**What stays local:** the wake word, your `.env`, ADVI's memory and its logs (`logs/`).
+
+## 7. When the AI is unavailable
+
+If every AI key fails (daily quota used up, no internet, or a bad key), ADVI still handles simple
+**built-in commands**:
+- opening apps, websites and folders;
+- playing, pausing and skipping media;
+- moving and organizing files;
+- time, battery and internet status;
+- messages and email, which still ask first.
+
+It tells you when it does this, and anything unclear waits for the AI. `ADVI_LOCAL_COMMANDS=first` in `.env`
+uses the built-in commands first, to save AI quota.
+
+**Free-tier tip:** extra Groq keys only add quota if they come from **different Groq accounts**.
+
+## 8. Troubleshooting
 
 | Problem | What to do |
 |---|---|
-| `SETUP FAILED … Python 3.13 was not found` | Install Python 3.13 64-bit from python.org (with the py launcher), then run the setup again |
-| "the AI service's daily quota is used up" | Wait for the reset (the message says when), or add a key from another Groq account, or a Gemini key |
-| "Telegram isn't signed in" | Open Telegram Desktop and sign in |
-| Telegram works but cannot find chats | Install Tesseract (`winget install UB-Mannheim.TesseractOCR`) |
-| Office shows "Product Activation Failed" | Nothing to do: ADVI closes the activation pop-up and still writes documents |
-| A website asks you to prove you're human | Complete the check in the ADVI Chrome window, then ask again |
-| Gmail opens but asks you to sign in | Sign in once in the Chrome window ADVI opened |
-| "Wake up ADVI" does nothing | Run `.venv\Scripts\python.exe -m advi.wake status`; if it isn't listening, run `... -m advi.wake install`. Check Windows Settings > Privacy > Microphone allows desktop apps. See `logs/wake.log` |
-| Something else | Look at `logs/advi.log` (the newest entries are at the end; it rotates at 20 MB) |
+| `SETUP FAILED … Python 3.13 was not found` | Install Python 3.13 64-bit from python.org (with the py launcher), then run setup again |
+| Setup says the project path is too long | Move the folder to a short path like `C:\ADVI` and run setup again |
+| "No language-model provider is configured" | Add a key to `.env` (Quick start, step 4) |
+| "The AI service's daily quota is used up" | Wait for the reset (the message says when), or add a key from another Groq account, or a Gemini key |
+| "Voice input is off because…" | Allow desktop apps to use the microphone (Windows privacy settings), check a microphone is connected, and restart ADVI |
+| "Wake up ADVI" does nothing | Run `.venv\Scripts\python.exe -m advi.wake status`; if it isn't listening, use `install` instead of `status`. Say the phrase as one short sentence. Details are in `logs/wake.log` |
+| ADVI starts by itself | It heard something like "hey ADVI". `logs/wake.log` shows what it heard. Turn the wake word off with `uninstall` |
+| Telegram can't find chats | Install Tesseract (`winget install UB-Mannheim.TesseractOCR`) and sign in to Telegram Desktop |
+| Office shows "Product Activation Failed" | Nothing to do: ADVI closes the pop-up and still writes documents |
+| A website asks you to prove you're human | Complete it yourself in ADVI's Chrome window, then ask again |
+| Anything else | See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) and the end of `logs/advi.log` |
 
-## 7. For developers
+## 9. Working on ADVI as a team
+
+**Before you push:**
+1. Work on a branch: `git checkout -b fix/whatsapp-focus`.
+2. Add or update a test in `tests/current/` for every behaviour change.
+3. Run the full test suite (offline, about 100 seconds):
+   ```powershell
+   .\.venv\Scripts\python.exe -m pytest -p no:cacheprovider --deselect tests/current/test_groq_smoke.py
+   ```
+4. Try the change in ADVI itself when it affects what users hear or see.
+5. Open a pull request saying what was wrong, what changed, and how you checked it.
+
+**New package?** Add it to `pyproject.toml`. Teammates get it automatically the next time they start ADVI
+after `git pull`.
+
+**Never commit** `.env`, `credentials/`, `logs/`, `runtime/`, `assets/whisper/` or `benchmarks/results/`. They
+hold keys, personal data and large downloads, and `.gitignore` already excludes them. Use `example.com`
+addresses and made-up names in tests.
 
 | Document | What it covers |
 |---|---|
-| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Setup in detail, configuration, running, testing, benchmarks, where files are written |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | The rules that keep ADVI trustworthy (verification, confirmation, honesty) |
+| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Setup in detail, configuration, tests, benchmarks, where files are written |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How ADVI is built, with diagrams |
-| [docs/ADVI_TECHNICAL_REPORT.md](docs/ADVI_TECHNICAL_REPORT.md) | The full technical report: design, implementation, testing, limitations |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Problems seen in practice and their fixes |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute |
+| [docs/ADVI_TECHNICAL_REPORT.md](docs/ADVI_TECHNICAL_REPORT.md) | The full technical report: design, testing, limitations |
 | [RELEASE_NOTES.md](RELEASE_NOTES.md) | What changed in each version |
+| `docs/audits/` | Engineering notes for each development phase |
 
-```powershell
-.\.venv\Scripts\python.exe -m pytest --deselect tests/current/test_groq_smoke.py   # ~940 tests, ~100 s
-.\.venv\Scripts\python.exe -m pytest tests/current/test_groq_smoke.py              # live Groq call (needs a key)
-```
-
-How a request flows:
-
-```text
-you -> AgentSession -> AI picks a tool -> ToolGuard/ToolRunner -> ExecutionEngine -> capability
-    -> the real computer -> verification -> result -> AI reply (spoken)
-```
+**Where things are in the code:**
 
 | Folder | What is in it |
 |---|---|
-| `src/advi/agent/` | Conversation and task loop (`session.py`), built-in commands (`local_intents.py`) |
-| `src/advi/capabilities/` | `desktop/` (apps, windows), `browser/` (Playwright + Chrome), `files/`, `apps/` (WhatsApp, Telegram), `office/` (Word), `gmail/` |
-| `src/advi/voice/` | Always-on listening, echo cancellation, speech recognition, hotkey, sounds |
-| `src/advi/wake/` | The background wake-word listener ("wake up ADVI") |
-| `src/advi/fallback/` | "David": Gmail and other tasks through the browser |
+| `src/advi/agent/` | The conversation and task loop (`session.py`), built-in commands, name handling |
+| `src/advi/capabilities/` | Everything that touches the computer: desktop, browser, files, Office, WhatsApp/Telegram, Gmail, system |
+| `src/advi/voice/` | Listening, echo cancellation, speech recognition, sounds, hotkey |
+| `src/advi/wake/` | The background wake-word listener |
 | `src/advi/providers/` | Groq and Gemini clients with automatic failover |
+| `src/advi/fallback/` | "DAVID": the separate fallback that works through the browser |
 | `benchmarks/` | Desktop Suite, capability sweep, WebVoyager sample |
-| `tests/current/` | Test suite |
-| `docs/` | Architecture, development and troubleshooting guides, the technical report, and `docs/audits/` (development history) |
+| `tests/current/` | The test suite |
 
-Optional extras:
-- Piper neural voice files in `assets/` (see `assets/README.md`); otherwise Windows' built-in voice is used.
-- MCP servers via `mcp_servers.json` (copy `mcp_servers.json.example`).
-
-Never commit `.env`, `credentials/`, `logs/`, `runtime/`, `assets/whisper/` or `benchmarks/results/`;
-`.gitignore` already excludes them.
+**Optional extras:**
+- A Piper neural voice in `assets/` (see `assets/README.md`); otherwise Windows' built-in voice is used.
+- MCP servers in `mcp_servers.json` (copy `mcp_servers.json.example`).
+- A Picovoice Porcupine wake-word engine (see `.env.example`).

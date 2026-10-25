@@ -7,5 +7,11 @@ if not exist ".venv\Scripts\python.exe" (
   pause
   exit /b 1
 )
+rem After "git pull", install whatever the new code needs (once; instant when nothing changed).
+".venv\Scripts\python.exe" scripts\ensure_install.py
+if errorlevel 1 (
+  pause
+  exit /b 1
+)
 ".venv\Scripts\python.exe" -m advi.app %*
 endlocal

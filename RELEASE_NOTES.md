@@ -69,7 +69,8 @@ The full write-up is `docs/ADVI_TECHNICAL_REPORT.md`.
     support (found by a fresh-copy install);
   - pre-downloads the offline speech model and the wake-word model;
   - registers the wake listener at Windows sign-in (unless `ADVI_WAKE=off`).
-- `run_advi.bat` works from any working directory.
+- `run_advi.bat` works from any working directory, and after `git pull` installs whatever new packages and
+  models the code needs, once, before starting.
 - New dependencies: `faster-whisper`, `sounddevice`, `livekit` (WebRTC echo cancellation). Declared explicitly:
   `pywin32`, `comtypes`.
 - `requirements-lock.txt` records the tested versions.
@@ -83,10 +84,12 @@ The full write-up is `docs/ADVI_TECHNICAL_REPORT.md`.
   and the technical report.
 
 **Upgrading from 0.3.4**
-1. Pull.
-2. Rerun `SETUP_ADVI.bat`. It installs the new packages, downloads the speech models and turns on the wake
-   word; your `.env` is kept.
+1. `git pull`.
+2. Start ADVI with `run_advi.bat` as usual. The first time, it sees that the code changed and installs the new
+   packages, downloads the speech models and turns on the wake word (a few minutes, announced aloud), then
+   starts. Your `.env` is kept. (`scripts/ensure_install.py`; rerunning `SETUP_ADVI.bat` does the same.)
 3. Optionally copy the new voice settings from `.env.example` into your `.env`. Every one has a default.
+   `ADVI_WAKE=off` in `.env` before the first start skips the wake word.
 
 Validation: 963 tests passed (`pytest --deselect tests/current/test_groq_smoke.py`). Live results are in
 `docs/benchmarks/` and the phase notes.

@@ -125,6 +125,9 @@ Write-Host "Running the current ADVI regression suite..." -ForegroundColor Yello
 & $venvPython -m pytest --deselect tests/current/test_groq_smoke.py
 if ($LASTEXITCODE -ne 0) { throw "ADVI regression tests failed. Fix the failing test(s) before using the installation." }
 
+# Record what was installed: after a later "git pull", run_advi.bat installs only what changed.
+& $venvPython scripts\ensure_install.py --mark
+
 # The wake word: a background listener started at every Windows sign-in (HKCU Run,
 # no administrator rights), so "wake up ADVI" starts ADVI even when it is closed.
 # ADVI_WAKE=off in .env (or the environment) skips this.

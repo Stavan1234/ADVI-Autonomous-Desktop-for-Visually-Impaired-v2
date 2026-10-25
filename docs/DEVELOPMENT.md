@@ -61,6 +61,12 @@ version ranges in `pyproject.toml`:
 .\.venv\Scripts\python.exe -m pip install -e . --no-deps
 ```
 
+**After `git pull`.** `run_advi.bat` runs `scripts/ensure_install.py` first. It compares `pyproject.toml`
+with the state recorded at the last install (`.venv/advi_install_state.json`). When they differ, it stops the
+wake listener (it keeps package DLLs open), runs `pip install -e ".[dev]"`, downloads the speech models,
+re-registers the wake word, and records the new state. When nothing changed it takes about 0.1 s. Changing
+dependencies therefore needs no extra step from teammates; just change `pyproject.toml`.
+
 ## 3. Configure
 
 Open `.env` and set at least one key:
