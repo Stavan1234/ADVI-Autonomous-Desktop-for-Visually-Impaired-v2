@@ -74,6 +74,47 @@ INTERACTIVE_TYPES = (
 _CONSOLE_CLASSES = {"ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS", "Shell_TrayWnd", "Progman", "WorkerW"}
 
 
+def force_foreground(hwnd: int) -> bool:
+    """Bring a window to the front despite Windows' foreground lock.
+
+    SetForegroundWindow is refused when ADVI isn't the foreground app (the user
+    was in YouTube: "WhatsApp is open but I couldn't bring its window to the
+    front", live log 2026-10-24). The usual remedies, in order: a plain call; a
+    tapped Alt key, which makes Windows treat the next call as user-initiated;
+    attaching to the foreground thread's input queue.
+    """
+    if os.name != "nt" or not hwnd:
+        return False
+    user32 = ctypes.windll.user32
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+
+    def front() -> bool:
+        time.sleep(0.15)
+        return int(user32.GetForegroundWindow() or 0) == int(hwnd)
+
+    user32.SetForegroundWindow(hwnd)
+    if front():
+        return True
+    user32.keybd_event(0x12, 0, 0, 0)  # Alt down
+    user32.keybd_event(0x12, 0, 2, 0)  # Alt up
+    user32.SetForegroundWindow(hwnd)
+    if front():
+        return True
+    foreground = user32.GetForegroundWindow()
+    target_thread = user32.GetWindowThreadProcessId(hwnd, None)
+    current_thread = user32.GetWindowThreadProcessId(foreground, None) if foreground else 0
+    if current_thread and current_thread != target_thread:
+        user32.AttachThreadInput(current_thread, target_thread, True)
+        try:
+            user32.BringWindowToTop(hwnd)
+            user32.ShowWindow(hwnd, 5)  # SW_SHOW
+            user32.SetForegroundWindow(hwnd)
+        finally:
+            user32.AttachThreadInput(current_thread, target_thread, False)
+    return front()
+
+
 class WindowsUiaDriver:
     """UIA via pywinauto's COM bindings; keyboard/mouse via pywinauto."""
 
@@ -247,12 +288,7 @@ class WindowsUiaDriver:
     def bring_to_front(self, window: UiaNode) -> bool:
         if os.name != "nt" or not window.hwnd:
             return False
-        user32 = ctypes.windll.user32
-        if user32.IsIconic(window.hwnd):
-            user32.ShowWindow(window.hwnd, 9)
-        user32.SetForegroundWindow(window.hwnd)
-        time.sleep(0.2)
-        return int(user32.GetForegroundWindow()) == int(window.hwnd)
+        return force_foreground(int(window.hwnd))
 
     def find_first(self, root, *, control_type=None, name=None, automation_id=None):
         element = root.raw.FindFirst(

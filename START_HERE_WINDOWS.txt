@@ -1,14 +1,17 @@
 ADVI - START HERE
 =================
 
-1. Install Python 3.13 (64-bit) from python.org and Google Chrome.
-2. Double-click SETUP_ADVI.bat
-3. Open .env in Notepad and paste at least one AI key:
+1. Install Python 3.13 (64-bit, with the "py launcher") from python.org, and Google Chrome.
+2. Put this folder at a SHORT path, for example C:\ADVI (Windows path-length limit).
+3. Double-click SETUP_ADVI.bat (10-20 minutes the first time).
+4. Open .env in Notepad and paste at least one AI key:
      GROQ_API_KEY=...      (free: https://console.groq.com/keys)
      GEMINI_API_KEY=...    (free: https://aistudio.google.com/apikey)
-4. Double-click run_advi.bat and type a request, for example:
+5. Double-click run_advi.bat. When ADVI says it is ready, talk to it or type a request, for example:
      open youtube
      play believer by imagine dragons
      write a short speech on courage in word and save it on desktop
+   Say or type "sleep" or "exit" to close it.
+6. Next time, just say "wake up ADVI" - even after restarting the PC. ADVI starts by itself.
 
 Everything else (things to try, safety, troubleshooting) is in README.md.

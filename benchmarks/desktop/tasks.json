@@ -1,0 +1,495 @@
+{
+  "suite": "ADVI Desktop Suite",
+  "version": 1,
+  "notes": "Every task runs in its own folder under Documents\\ADVI Bench (written as {dir} below). Tasks with a 'waa' id are adapted from Windows Agent Arena (MIT, microsoft/WindowsAgentArena, examples/file_explorer and examples/notepad): same goal and the same kind of end-state check, re-rooted from C:\\Users\\Docker\\<folder> into the sandbox so a personal laptop is never touched outside it. Checks are re-implemented here; two WAA originals had broken checks (5316686e sets the opposite registry value; 5548314e checks a misspelled path), so their evaluators are not reused.",
+  "tasks": [
+    {
+      "id": "waa-archive-docx",
+      "waa": "0c9dda13-428c-492b-900b-f48562111f93",
+      "domain": "files",
+      "instruction": "In the folder Documents\\ADVI Bench\\waa-archive-docx, create a new folder named \"Archive\" and move all .docx files into it.",
+      "setup": [
+        {
+          "docx": "Doc01.docx",
+          "text": "First document"
+        },
+        {
+          "docx": "Doc02.docx",
+          "text": "Second document"
+        },
+        {
+          "file": "notes.txt",
+          "text": "stay here"
+        }
+      ],
+      "checks": [
+        {
+          "exists": "Archive/Doc01.docx"
+        },
+        {
+          "exists": "Archive/Doc02.docx"
+        },
+        {
+          "missing": "Doc01.docx"
+        },
+        {
+          "missing": "Doc02.docx"
+        },
+        {
+          "exists": "notes.txt"
+        }
+      ]
+    },
+    {
+      "id": "waa-move-folder",
+      "waa": "1876fe7f-6fdc-5dd6-c9e0-237d4c8411f0",
+      "domain": "files",
+      "instruction": "Move the folder named \"MyFolder\" from Documents\\ADVI Bench\\waa-move-folder\\Desktop to Documents\\ADVI Bench\\waa-move-folder\\Documents.",
+      "setup": [
+        {
+          "dir": "Desktop/MyFolder"
+        },
+        {
+          "file": "Desktop/MyFolder/a.txt",
+          "text": "a"
+        },
+        {
+          "dir": "Documents"
+        }
+      ],
+      "checks": [
+        {
+          "exists": "Documents/MyFolder/a.txt"
+        },
+        {
+          "missing": "Desktop/MyFolder"
+        }
+      ]
+    },
+    {
+      "id": "waa-list-png",
+      "waa": "016c9a9d-f2b9-4428-8fdb-f74f4439ece6",
+      "domain": "files",
+      "instruction": "Search for all files with the extension .png in the folder Documents\\ADVI Bench\\waa-list-png and list their full names in png_files.txt in the same folder.",
+      "setup": [
+        {
+          "png": "cs-black-000.png"
+        },
+        {
+          "png": "cs-gray-7f7f7f.png"
+        },
+        {
+          "png": "cs-white-fff.png"
+        },
+        {
+          "file": "readme.txt",
+          "text": "not an image"
+        }
+      ],
+      "checks": [
+        {
+          "file_lists": "png_files.txt",
+          "names": [
+            "cs-black-000.png",
+            "cs-gray-7f7f7f.png",
+            "cs-white-fff.png"
+          ],
+          "not": [
+            "readme.txt"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "waa-large-files-report",
+      "waa": "2d292a2d-686b-4e72-80f7-af6c232b1258",
+      "domain": "files",
+      "instruction": "Check the files in Documents\\ADVI Bench\\waa-large-files-report\\Downloads and create a text file listing the names of all files larger than 5MB. Save the report in Documents\\ADVI Bench\\waa-large-files-report as 'report.txt'.",
+      "setup": [
+        {
+          "file": "Downloads/example.txt",
+          "text": "small text file"
+        },
+        {
+          "sized": "Downloads/testing.bin",
+          "bytes": 15000000
+        },
+        {
+          "sized": "Downloads/photo.jpg",
+          "bytes": 1200000
+        }
+      ],
+      "checks": [
+        {
+          "file_lists": "report.txt",
+          "names": [
+            "testing.bin"
+          ],
+          "not": [
+            "example.txt",
+            "photo.jpg"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "waa-remove-empty",
+      "waa": "b12b2d3a-7da1-4aeb-97cc-6026d3975210",
+      "domain": "files",
+      "instruction": "Remove all empty folders within Documents\\ADVI Bench\\waa-remove-empty\\Downloads.",
+      "setup": [
+        {
+          "file": "Downloads/Photos/hello.txt",
+          "text": "Hello World 1"
+        },
+        {
+          "file": "Downloads/GroceryList/hello.txt",
+          "text": "Hello World 1"
+        },
+        {
+          "dir": "Downloads/ToDoLists"
+        }
+      ],
+      "checks": [
+        {
+          "missing": "Downloads/ToDoLists"
+        },
+        {
+          "exists": "Downloads/Photos/hello.txt"
+        },
+        {
+          "exists": "Downloads/GroceryList/hello.txt"
+        }
+      ]
+    },
+    {
+      "id": "waa-hide-file",
+      "waa": "e27984c7-968c-48d7-b2c3-6e45cdcc5249",
+      "domain": "files",
+      "instruction": "Set the file \"secret.txt\" in Documents\\ADVI Bench\\waa-hide-file as hidden.",
+      "setup": [
+        {
+          "file": "secret.txt",
+          "text": "secret"
+        }
+      ],
+      "checks": [
+        {
+          "hidden": "secret.txt"
+        }
+      ]
+    },
+    {
+      "id": "waa-zip-backup",
+      "waa": "5548314e-d807-4e9e-97e9-b3a4f9fd634f",
+      "domain": "files",
+      "instruction": "Create a zip archive named \"DownloadsBackup.zip\" from all files in Documents\\ADVI Bench\\waa-zip-backup\\Downloads, and save it in that Downloads folder.",
+      "setup": [
+        {
+          "file": "Downloads/SampleText.txt",
+          "text": "sample text"
+        },
+        {
+          "file": "Downloads/notes.md",
+          "text": "# notes"
+        }
+      ],
+      "checks": [
+        {
+          "zip_has": "Downloads/DownloadsBackup.zip",
+          "names": [
+            "SampleText.txt",
+            "notes.md"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "waa-notepad-draft",
+      "waa": "366de66e-cbae-4d72-b042-26390db2b145",
+      "domain": "notepad",
+      "instruction": "Please open Notepad, create a new file named \"draft.txt\", type \"This is a draft.\", and save it to Documents\\ADVI Bench\\waa-notepad-draft.",
+      "setup": [],
+      "checks": [
+        {
+          "text_equals": "draft.txt",
+          "text": "This is a draft."
+        }
+      ]
+    },
+    {
+      "id": "waa-notepad-count",
+      "waa": "a7d4b6c5-569b-452e-9e1d-ffdb3d431d15",
+      "domain": "notepad",
+      "instruction": "Please open the file \"largefile.txt\" in Documents\\ADVI Bench\\waa-notepad-count, count every instance of the word \"example\", and save only that number to a file named example_count.txt in the same folder.",
+      "setup": [
+        {
+          "generated_text": "largefile.txt",
+          "word": "example",
+          "count": 37,
+          "lines": 400
+        }
+      ],
+      "checks": [
+        {
+          "text_equals": "example_count.txt",
+          "text": "37"
+        }
+      ]
+    },
+    {
+      "id": "advi-create-folder",
+      "domain": "files",
+      "instruction": "Create a folder called Projects in Documents\\ADVI Bench\\advi-create-folder.",
+      "setup": [],
+      "checks": [
+        {
+          "is_dir": "Projects"
+        }
+      ]
+    },
+    {
+      "id": "advi-rename-file",
+      "domain": "files",
+      "instruction": "Rename the file draft1.txt in Documents\\ADVI Bench\\advi-rename-file to final.txt.",
+      "setup": [
+        {
+          "file": "draft1.txt",
+          "text": "keep this text"
+        }
+      ],
+      "checks": [
+        {
+          "text_equals": "final.txt",
+          "text": "keep this text"
+        },
+        {
+          "missing": "draft1.txt"
+        }
+      ]
+    },
+    {
+      "id": "advi-copy-file",
+      "domain": "files",
+      "instruction": "Copy budget.txt from Documents\\ADVI Bench\\advi-copy-file into the Backup folder there.",
+      "setup": [
+        {
+          "file": "budget.txt",
+          "text": "rent 9000"
+        },
+        {
+          "dir": "Backup"
+        }
+      ],
+      "checks": [
+        {
+          "text_equals": "Backup/budget.txt",
+          "text": "rent 9000"
+        },
+        {
+          "exists": "budget.txt"
+        }
+      ]
+    },
+    {
+      "id": "advi-move-pdfs",
+      "domain": "files",
+      "instruction": "Move all pdf files in Documents\\ADVI Bench\\advi-move-pdfs into a folder called PDF in the same place.",
+      "setup": [
+        {
+          "pdf": "a.pdf"
+        },
+        {
+          "pdf": "b.pdf"
+        },
+        {
+          "file": "c.txt",
+          "text": "c"
+        }
+      ],
+      "checks": [
+        {
+          "exists": "PDF/a.pdf"
+        },
+        {
+          "exists": "PDF/b.pdf"
+        },
+        {
+          "missing": "a.pdf"
+        },
+        {
+          "exists": "c.txt"
+        }
+      ]
+    },
+    {
+      "id": "advi-organize",
+      "domain": "files",
+      "instruction": "Organize the files in Documents\\ADVI Bench\\advi-organize by type.",
+      "setup": [
+        {
+          "file": "song.mp3",
+          "bytes_text": "ID3"
+        },
+        {
+          "pdf": "paper.pdf"
+        },
+        {
+          "png": "photo.png"
+        },
+        {
+          "file": "list.txt",
+          "text": "x"
+        }
+      ],
+      "checks": [
+        {
+          "none_at_top": [
+            "song.mp3",
+            "paper.pdf",
+            "photo.png",
+            "list.txt"
+          ]
+        },
+        {
+          "exists_somewhere": [
+            "song.mp3",
+            "paper.pdf",
+            "photo.png",
+            "list.txt"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "advi-find-file",
+      "domain": "files",
+      "instruction": "Where is the file named invoice-7731.txt inside Documents\\ADVI Bench\\advi-find-file? Tell me which folder it is in.",
+      "setup": [
+        {
+          "file": "2024/March/invoice-7731.txt",
+          "text": "invoice"
+        },
+        {
+          "file": "2024/April/other.txt",
+          "text": "x"
+        }
+      ],
+      "checks": [
+        {
+          "answer_matches": "March"
+        }
+      ]
+    },
+    {
+      "id": "advi-read-file",
+      "domain": "files",
+      "instruction": "Read meeting.txt in Documents\\ADVI Bench\\advi-read-file and tell me what time the meeting is.",
+      "setup": [
+        {
+          "file": "meeting.txt",
+          "text": "Team sync moved. The meeting is now at 4:30 PM in room 12."
+        }
+      ],
+      "checks": [
+        {
+          "answer_matches": "4[:.]30"
+        }
+      ]
+    },
+    {
+      "id": "advi-write-file",
+      "domain": "files",
+      "instruction": "Create a text file named shopping.txt in Documents\\ADVI Bench\\advi-write-file with the words milk, eggs and bread, each on its own line.",
+      "setup": [],
+      "checks": [
+        {
+          "text_has_lines": "shopping.txt",
+          "lines": [
+            "milk",
+            "eggs",
+            "bread"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "advi-word-table",
+      "domain": "word",
+      "instruction": "Create a Word document named Stations with a table of three Mumbai local train stations and their line, and save it in Documents\\ADVI Bench\\advi-word-table.",
+      "setup": [],
+      "checks": [
+        {
+          "docx_table_rows": "Stations.docx",
+          "min_rows": 3
+        }
+      ]
+    },
+    {
+      "id": "advi-word-pdf",
+      "domain": "word",
+      "instruction": "Write a short note about drinking water in Word and save it as a PDF named Water in Documents\\ADVI Bench\\advi-word-pdf.",
+      "setup": [],
+      "checks": [
+        {
+          "pdf_has_text": "Water.pdf",
+          "words": [
+            "water"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "advi-open-site",
+      "domain": "browser",
+      "instruction": "Open wikipedia.org.",
+      "setup": [],
+      "checks": [
+        {
+          "browser_url_matches": "wikipedia\\.org"
+        }
+      ]
+    },
+    {
+      "id": "advi-site-search",
+      "domain": "browser",
+      "instruction": "Search for Mount Everest on Wikipedia.",
+      "setup": [],
+      "checks": [
+        {
+          "browser_url_matches": "wikipedia\\.org.*(Mount_Everest|search=Mount)"
+        }
+      ]
+    },
+    {
+      "id": "advi-battery",
+      "domain": "system",
+      "instruction": "What is my battery level?",
+      "setup": [],
+      "checks": [
+        {
+          "answer_battery_percent": 3
+        }
+      ]
+    },
+    {
+      "id": "advi-whatsapp-confirm",
+      "domain": "messaging",
+      "instruction": "Send hello from the benchmark to New Chapter on WhatsApp.",
+      "setup": [],
+      "checks": [
+        {
+          "confirmation_matches": [
+            "New Chapter",
+            "hello from the benchmark"
+          ]
+        },
+        {
+          "no_tool": [
+            "whatsapp_send_message"
+          ]
+        }
+      ]
+    }
+  ]
+}

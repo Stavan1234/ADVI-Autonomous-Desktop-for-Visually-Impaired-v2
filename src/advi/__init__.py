@@ -1,3 +1,3 @@
-"""ADVI — Autonomous Desktop for Visually Impaired."""
+"""ADVI: Autonomous Desktop for the Visually Impaired."""
 
-__version__ = "0.3.4"
+__version__ = "0.4.0"

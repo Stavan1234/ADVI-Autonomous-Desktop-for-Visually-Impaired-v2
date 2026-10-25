@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
+import os
 from pathlib import Path
+import threading
+import time
 
 from advi.agent import AgentSession
 from advi.capabilities.registry import build_default_registry
@@ -15,7 +18,8 @@ from advi.core.verification import ToolVerifier
 from advi.capabilities.desktop.context import DesktopContext
 from advi.integrations.gmail import LazyGmailService
 from advi.integrations.mcp import MCPManager
-from advi.io.console import print_banner, print_shutdown, read_line, StartupAnnouncer
+from advi.core.config import ASSET_ROOT, RUNTIME_ROOT
+from advi.io.console import InputHub, StartupAnnouncer, print_banner, print_line, print_shutdown
 from advi.io.output import AdviResponse, OutputManager
 from advi.io.tts import PiperTTS
 from advi.memory.consolidator import SessionConsolidator
@@ -26,8 +30,13 @@ from advi.fallback.provider_bridge import DavidProviderBridge
 from advi.fallback.service import FallbackService
 from advi.memory.service import MemoryService
 from advi.tools import ToolGuard, ToolRegistry, ToolRunner
+from advi.voice import start_voice, transcriber_from_env, voice_enabled
+from advi.voice.listener import open_duplex_audio
+from advi.wake import autostart as wake_autostart
+from advi.wake.presence import APP_MUTEX, hold as hold_mutex
 
 logger = logging.getLogger(__name__)
+
 
 
 def _build_groq_providers(settings):
@@ -75,6 +84,9 @@ def main() -> None:
     agent = None
     output = None
     announcer = None
+    # Tells the wake listener ADVI is running (it lets go of the microphone);
+    # Windows drops it when this process ends, even after a crash.
+    app_mutex, _ = hold_mutex(APP_MUTEX)
 
     try:
         # Settings are cheap. Voice is the first real runtime resource so the very
@@ -88,6 +100,12 @@ def main() -> None:
             output_wav=settings.tts_output,
         )
         voice_ready = tts.preflight()
+        # With voice on, every sound ADVI makes goes through one duplex stream with
+        # echo cancellation, from the first startup sentence on: the microphone
+        # must never hear ADVI's own voice as a request (live log 2026-10-25).
+        audio = open_duplex_audio() if voice_enabled() else None
+        if audio is not None and voice_ready:
+            tts.attach_player(audio)
         announcer = StartupAnnouncer(
             speaker=tts.speak if voice_ready else None,
             interval_seconds=7.0,
@@ -95,7 +113,15 @@ def main() -> None:
         announcer.start()
 
         runtime.start()
+        # The wake listener must already be listening when "sleep" closes ADVI.
+        wake_word = False
+        try:
+            wake_word = wake_autostart.ensure_running()
+        except Exception as exc:
+            logger.warning("Wake listener could not be started: %s", exc)
 
+        if audio is not None:
+            runtime.register_resource(audio)  # closed after the output below (reverse order)
         output = OutputManager(tts=tts if voice_ready else None)
         runtime.register_resource(output)
 
@@ -181,14 +207,22 @@ def main() -> None:
         # provider session construction, semantic model load, saved Gmail token
         # preparation, MCP connection/tool discovery, and capability readiness.
         prep_jobs = {"provider session": agent.prepare}
-        if retriever is not None:
-            prep_jobs["semantic memory"] = retriever.preload
+        # The semantic memory model takes ~15 s to load (PyTorch); memory search is
+        # lexical until it is ready, so it loads in the background after startup
+        # instead of delaying "ready" (which matters when the wake word starts ADVI).
         if memory_service is not None:
             prep_jobs["experience memory"] = memory_service.warm_experience
         if gmail_service is not None:
             prep_jobs["Gmail session"] = gmail_service.prepare
         if mcp_manager is not None:
             prep_jobs["MCP servers"] = mcp_manager.prepare
+        # The local speech model loads once here, alongside the other preparation.
+        transcriber = (
+            transcriber_from_env(ASSET_ROOT, settings.groq_api_keys, notify=output.say) if voice_enabled() else None
+        )
+        if transcriber is not None:
+            prep_jobs["speech recognition"] = transcriber.preload
+            agent.speech_status = transcriber.status_sentence
 
         if prep_jobs:
             with ThreadPoolExecutor(max_workers=min(4, len(prep_jobs))) as executor:
@@ -197,9 +231,7 @@ def main() -> None:
                     name = future_map[future]
                     try:
                         result = future.result()
-                        if name == "semantic memory" and not result:
-                            logger.warning("Semantic memory could not be warmed; lexical memory remains available.")
-                        elif name == "experience memory":
+                        if name == "experience memory":
                             logger.info("Experience memory warmed: %s high-confidence lesson(s).", result)
                         elif name == "MCP servers" and result is False:
                             logger.warning("No configured MCP server completed startup preparation.")
@@ -221,23 +253,93 @@ def main() -> None:
         if startup.state == "degraded":
             logger.warning("ADVI starting with optional degraded capabilities: %s", startup.degraded_checks)
 
+        def exit_now() -> None:
+            # Stop the running task; if it doesn't hand control back soon (a tool stuck
+            # in a long call), leave anyway: the user asked to close ADVI.
+            agent.request_stop()
+
+            def force() -> None:
+                if left_loop.wait(8.0):
+                    return  # the normal shutdown is under way
+                logger.warning("ADVI was still busy 8 s after exit was requested; closing now.")
+                print_shutdown()
+                os._exit(0)
+
+            threading.Thread(target=force, name="advi-exit-watchdog", daemon=True).start()
+
+        left_loop = threading.Event()
+        hub = InputHub(on_exit=exit_now)
+        voice = None
+        voice_message = ""
+        if transcriber is not None:
+            voice, voice_message = start_voice(
+                transcriber,
+                submit=hub.put_voice,
+                is_busy=lambda: hub.busy,
+                say=output.say,
+                is_quiet=output.is_quiet,
+                stop_speech=output.silence,
+                request_stop=agent.request_stop,
+                request_exit=hub.request_exit,
+                spoken_recently=output.spoken_recently,
+                pause_speech=output.pause_speech,
+                resume_speech=output.resume_speech,
+                audio=audio,
+                wake_word=wake_word,
+            )
+            if voice is not None:
+                runtime.register_resource(voice)
+
+        if retriever is not None:
+            def warm_semantic_memory() -> None:
+                if not retriever.preload():
+                    logger.warning("Semantic memory could not be warmed; lexical memory remains available.")
+
+            threading.Thread(target=warm_semantic_memory, name="advi-semantic-memory", daemon=True).start()
+
+        ready = "Everything is ready, sir." + (f" {voice_message}" if voice_message else "")
         if announcer is not None:
-            announcer.stop(final_message="Everything is ready, sir.")
+            announcer.stop()
             announcer = None
+        # Spoken through the output queue: the main loop starts listening for requests
+        # while this long sentence is still being said.
+        print_line(f"\nADVI › {ready}")
+        output.deliver(AdviResponse(ready), display=False)
         print_banner()
+        hub.start()
+        if voice is not None:
+            # The first time voice is used, teach the sounds once: earcons only help
+            # when people know what they mean.
+            marker = RUNTIME_ROOT / "voice_sound_guide_played"
+            if not marker.exists():
+                try:
+                    marker.parent.mkdir(parents=True, exist_ok=True)
+                    marker.write_text("1", encoding="utf-8")
+                    voice.play_sound_guide()
+                except OSError:
+                    logger.debug("Sound guide marker could not be written", exc_info=True)
 
         while True:
             try:
-                user_input = read_line()
-            except (EOFError, KeyboardInterrupt):
+                source, user_input = hub.get()
+            except KeyboardInterrupt:
                 print()
                 break
-            if not user_input:
-                continue
-            if user_input.casefold() in {"exit", "quit", "sleep"}:
+            if source in {"eof", "exit"}:
+                # Typed exit / quit / sleep, or a spoken "exit" / "sleep" / "close ADVI", closes
+                # ADVI completely (2026-10-25); the wake listener starts it again.
+                left_loop.set()
+                if source == "exit" and voice is not None:
+                    output.wait_quiet(6.0)  # let "Going to sleep..." / "Goodbye." finish
+                print()
                 break
-
-            logger.info("User input received: %r", user_input)
+            user_input = user_input.strip()
+            if not user_input:
+                hub.busy = False
+                continue
+            logger.info("User input received (%s): %r", source, user_input)
+            hub.busy = True
+            response = None
             try:
                 output.start_progress()
                 response = agent.respond(user_input)
@@ -245,6 +347,8 @@ def main() -> None:
             except Exception as exc:
                 logger.exception("Agent request failed: %s", exc)
                 output.deliver(AdviResponse("I ran into a problem processing that request."))
+            finally:
+                hub.busy = False
 
     except Exception:
         logger.exception("ADVI startup failed before interactive mode became ready.")
@@ -261,6 +365,9 @@ def main() -> None:
         if runtime is not None:
             runtime.shutdown(session_summary=runtime.session_summary)
         print_shutdown()
+        from advi.wake.presence import release as release_mutex
+
+        release_mutex(app_mutex)
 
 
 def _consolidate_session(agent: AgentSession, runtime: Runtime) -> None:

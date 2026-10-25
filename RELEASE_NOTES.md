@@ -1,6 +1,98 @@
-ADVI 0.3.4 — Remaining Log Fixes (2026-09-30)
+# ADVI release notes
 
-ADVI 0.3.4 — Remaining Log Fixes (2026-09-30)
+## ADVI 0.4.0: voice, verified capabilities and onboarding (2026-10-25)
+
+Everything since the last commit (`dc46e96`, 2026-10-14). The details, with the logs and tests behind each
+change, are in `docs/audits/PHASE8_WHATSAPP_AND_HONESTY_FIXES.md` to `PHASE15_ECHO_SLEEP_WAKE.md`.
+The full write-up is `docs/ADVI_TECHNICAL_REPORT.md`.
+
+**Voice (new, `src/advi/voice/`)**
+- Always-on listening with Silero VAD end-of-speech detection, a 0.3 s pre-roll and a continuation window
+  for unfinished sentences.
+- Speech recognition: Groq Whisper large-v3-turbo online, local faster-whisper (`distil-small.en`) offline.
+  ADVI tells the user once when it switches, and answers "why are you slow?".
+- Turn-taking:
+  - a soft earcon family (your turn, heard, got it, working, stopped, not heard, wake, sleep) with a
+    spoken sound guide;
+  - a name gate while music or a video plays.
+- **ADVI no longer hears itself:** all speech and sounds play through one duplex audio stream with WebRTC
+  echo cancellation (AEC3, via `livekit`), which removes ADVI's voice from the microphone. Measured: 53
+  speech frames from ADVI's own voice on the raw microphone, 0 after cancellation. Talking over ADVI
+  stops it at once (barge-in). Speech is synthesized sentence by sentence and stops instantly.
+- File paths are spoken as "poem.txt in Downloads", not character by character.
+- When speech starts while ADVI talks, ADVI pauses; if it was its own voice or noise it resumes where it
+  stopped, so answers are no longer cut short by a leaked echo.
+- New `get_network_status` tool: "is internet connected?" gets a real answer (and works offline).
+- Read-only questions are no longer answered "couldn't verify the final state" after an earlier failed look.
+- **"Sleep"**, like "exit", "quit" and "close ADVI" (spoken or typed), closes ADVI completely, even mid-task.
+- **Wake word:** "wake up ADVI" / "hey ADVI" starts ADVI even when it is closed. A background listener
+  (`python -m advi.wake`, registered by setup at every Windows sign-in) detects the phrase on this PC with
+  Silero VAD and Whisper `tiny.en`; a supervisor restarts it after a crash. Optional Picovoice Porcupine engine.
+- A hidden global hotkey (Ctrl+Alt+Space, falling back to Ctrl+Alt+Z / Ctrl+Alt+Enter) interrupts ADVI's
+  speech, and starts ADVI while it is closed.
+- Faster start: the semantic-memory model loads in the background (warm start to "listening" 23.7 s → 11.8 s).
+
+**Names and corrections**
+- Spelled names ("S I Y U"), sound-alike matching against learned WhatsApp/Telegram chats, and remembered
+  aliases ("CU" → "Siyu").
+- Corrections at a confirmation ("it's ADVI, not Adri", "send it to Siyu instead") change the pending
+  action and ask again.
+- "Try again" retries exactly what was confirmed.
+
+**Email**
+- New verified Gmail tools: `email_forward` and `email_trash` (both confirmed), `email_archive`,
+  `email_mark`.
+- The email body editor, word corrections, and inbox reads no longer replaced by the sent draft.
+
+**Vision**
+- `look_at_screen`: Gemini describes a screenshot in words, as a last resort; at most two automatic looks
+  per task. It never gives click coordinates.
+
+**Reliability (from live sessions, the Desktop Suite and a 38-task capability sweep)**
+- Word tables, including one-column tables, are real Word tables; Excel accepts Markdown, tab and CSV tables.
+- Safety:
+  - closing an app only closes the app the user asked for (a sweep run tried to close an unrelated browser
+    window);
+  - searches naming a site use that site;
+  - a voice "stop" interrupts long searches.
+- Fixed false "couldn't verify" answers, the provider-failover handoff hiding file listings, wrong-profile
+  save paths, Notepad session restore, and media-player detection.
+
+**Benchmarks (new, `benchmarks/`)**
+- The Desktop Suite: 23 execution-checked tasks, 9 adapted from Windows Agent Arena.
+- The capability sweep: 38 live feature checks.
+- A WebVoyager harness (Emergence WebVoyager, MIT, with a stratified sample and human judging).
+
+**Setup and repository**
+- `setup_windows.ps1`:
+  - stops early with instructions when the project path is too long for Windows without long-path
+    support (found by a fresh-copy install);
+  - pre-downloads the offline speech model and the wake-word model;
+  - registers the wake listener at Windows sign-in (unless `ADVI_WAKE=off`).
+- `run_advi.bat` works from any working directory.
+- New dependencies: `faster-whisper`, `sounddevice`, `livekit` (WebRTC echo cancellation). Declared explicitly:
+  `pywin32`, `comtypes`.
+- `requirements-lock.txt` records the tested versions.
+- The log rotates at 20 MB.
+- `.env.example`:
+  - adds `ADVI_VOICE*`, `ADVI_STT_*`, `ADVI_ECHO_CANCEL`, `ADVI_WAKE*`, `PICOVOICE_ACCESS_KEY`,
+    `ADVI_VISION_MODEL`, `TESSERACT_CMD` and `ADVI_MCP_CONFIG`;
+  - drops `ADVI_CALL_TRACE` and `ADVI_TERMINAL_TRACE`, which nothing read.
+- `.gitignore` excludes downloaded models, raw benchmark results and local PDFs/ZIPs.
+- New docs: `ARCHITECTURE.md` (with diagrams), `DEVELOPMENT.md`, `TROUBLESHOOTING.md`, `CONTRIBUTING.md`
+  and the technical report.
+
+**Upgrading from 0.3.4**
+1. Pull.
+2. Rerun `SETUP_ADVI.bat`. It installs the new packages, downloads the speech models and turns on the wake
+   word; your `.env` is kept.
+3. Optionally copy the new voice settings from `.env.example` into your `.env`. Every one has a default.
+
+Validation: 963 tests passed (`pytest --deselect tests/current/test_groq_smoke.py`). Live results are in
+`docs/benchmarks/` and the phase notes.
+
+---
+## ADVI 0.3.4 — Remaining Log Fixes (2026-09-30)
 
 - Corrected `list_files` verification for the structured native listing payload.
 - Preserved recent folder/file/application aliases across task boundaries.

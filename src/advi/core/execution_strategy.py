@@ -96,7 +96,7 @@ def infer_execution_strategy(
     last_file_action = last in {
         "find_file", "list_files", "read_file", "open_file", "open_folder", "create_file",
         "save_file", "append_file", "replace_file_text", "delete_file", "copy_file", "move_file",
-        "rename_file", "copy_folder", "move_folder", "rename_folder", "delete_folder",
+        "rename_file", "copy_folder", "move_folder", "rename_folder", "delete_folder", "remove_empty_folders",
     }
     last_desktop_action = last in {
         "open_application", "new_document", "save_document", "save_document_as", "close_document",
@@ -230,10 +230,10 @@ def infer_execution_strategy(
 
 def is_observation_tool(name: str) -> bool:
     return str(name or "").casefold() in {
-        "inspect_web_page", "read_web_page", "read_screen", "inspect_window", "observe_window",
+        "inspect_web_page", "read_web_page", "read_screen", "inspect_window", "observe_window", "look_at_screen",
         "list_windows", "list_applications", "find_application", "find_file", "list_files",
         "search_file_content", "read_file", "get_system_info", "get_system_status",
-        "get_battery_status", "memory_search", "memory_retrieval", "contact_lookup", "wait",
+        "get_battery_status", "get_network_status", "memory_search", "memory_retrieval", "contact_lookup", "wait",
     }
 
 

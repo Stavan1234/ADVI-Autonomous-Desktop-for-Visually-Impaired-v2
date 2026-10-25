@@ -96,6 +96,37 @@ class VisionPerception:
 
         return screenshot_path
 
+    def grab(self) -> Any:
+        """The current screen as an in-memory image (nothing written to disk)."""
+        return _get_pyautogui().screenshot()
+
+    @staticmethod
+    def crop_to_window(image: Any, window_info: dict[str, Any] | None) -> tuple[Any, tuple[int, int], str]:
+        """Crop to a window's rectangle; returns (image, origin, scope)."""
+        if window_info is None:
+            return image, (0, 0), "full_screen"
+        left = max(0, int(window_info["left"]))
+        top = max(0, int(window_info["top"]))
+        right = min(image.width, int(window_info["right"]))
+        bottom = min(image.height, int(window_info["bottom"]))
+        if right <= left or bottom <= top:
+            return image, (0, 0), "full_screen"
+        return image.crop((left, top, right, bottom)), (left, top), "application_window"
+
+    def window_for(self, application: str | None) -> dict[str, Any] | None:
+        """The window named by the hint, or the foreground window without one."""
+        if application:
+            return self._find_relevant_window(application)
+        try:
+            from ctypes import wintypes
+
+            user32 = ctypes.WinDLL("user32")
+            user32.GetForegroundWindow.restype = wintypes.HWND
+            hwnd = user32.GetForegroundWindow()
+        except Exception:
+            return None
+        return self._tracked_window_info(int(hwnd)) if hwnd else None
+
     # =========================================================
     # SCREEN READING / OCR
     # =========================================================
@@ -113,31 +144,18 @@ class VisionPerception:
             full_path = self.capture_screen()
             image = Image.open(full_path)
             window_info = self._find_relevant_window(application)
-            origin_x = origin_y = 0
-            scope = "full_screen"
+            ocr_image, (origin_x, origin_y), scope = self.crop_to_window(image, window_info)
             screenshot_path = full_path
-            ocr_image = image
 
-            if window_info is not None:
-                left = max(0, int(window_info["left"]))
-                top = max(0, int(window_info["top"]))
-                right = min(image.width, int(window_info["right"]))
-                bottom = min(image.height, int(window_info["bottom"]))
-                if right > left and bottom > top:
-                    ocr_image = image.crop((left, top, right, bottom))
-                    origin_x, origin_y = left, top
-                    scope = "application_window"
-                    scoped_name = self._safe_scope_name(str(application or window_info.get("title") or "application"))
-                    scoped_path = self.screenshot_dir / f"current_{scoped_name}_window.png"
-                    try:
-                        ocr_image.save(scoped_path)
-                        screenshot_path = scoped_path
-                    except Exception:
-                        screenshot_path = full_path
-                    logger.info(
-                        "OCR restricted to application window '%s' [%s, %s, %s, %s].",
-                        window_info.get("title"), left, top, right, bottom,
-                    )
+            if scope == "application_window":
+                scoped_name = self._safe_scope_name(str(application or window_info.get("title") or "application"))
+                scoped_path = self.screenshot_dir / f"current_{scoped_name}_window.png"
+                try:
+                    ocr_image.save(scoped_path)
+                    screenshot_path = scoped_path
+                except Exception:
+                    screenshot_path = full_path
+                logger.info("OCR restricted to application window '%s'.", window_info.get("title"))
 
             text = ocr_text_from_image(ocr_image, pytesseract, page_segmentation_mode=11)
             return {

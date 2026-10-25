@@ -24,3 +24,17 @@ dist/
 
 # Local MCP server configuration may contain credentials and machine paths.
 mcp_servers.json
+
+# Downloaded speech models (hundreds of MB; fetched on first start into assets/whisper)
+# and optional Piper voice binaries (see assets/README.md).
+assets/whisper/
+assets/piper/
+assets/models/
+
+# Raw benchmark runs: screenshots of real web sessions and task records that can
+# contain the user's own emails and files. Summaries live in docs/benchmarks/.
+benchmarks/results/
+
+# Local reference material and input archives kept next to the project root.
+/*.pdf
+/*.zip

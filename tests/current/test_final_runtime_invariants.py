@@ -34,9 +34,12 @@ def test_verifier_summary_has_no_retired_finish_action() -> None:
 def test_app_interactive_exit_words_are_terminal_only() -> None:
     app_source = Path(__file__).resolve().parents[2] / "src" / "advi" / "app.py"
     text = app_source.read_text(encoding="utf-8")
-    assert '"sleep"' in text
-    assert '"exit"' in text
-    assert '"quit"' in text
+    # Typed exit / quit / sleep close ADVI, even mid-task (read on the input thread,
+    # 2026-10-24); a spoken "sleep" only stops listening.
+    from advi.io.console import InputHub
+
+    assert InputHub.EXIT_WORDS == {"exit", "quit", "sleep"}
+    assert 'source in {"eof", "exit"}' in text
     assert 'agent.respond(user_input)' in text
 
 

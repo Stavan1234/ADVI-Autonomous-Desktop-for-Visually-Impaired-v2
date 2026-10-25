@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import platform
 import socket
+import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -13,7 +15,11 @@ from advi.tools.contracts import ToolCall, ToolResult, VerificationStatus
 class SystemCapability:
     """Small, deterministic read-only capability for local machine information."""
 
-    SUPPORTED_ACTIONS = {"get_system_info", "get_system_status", "get_battery_status"}
+    SUPPORTED_ACTIONS = {"get_system_info", "get_system_status", "get_battery_status", "get_network_status"}
+    # Asked "is internet connected?", the AI had no tool for it and opened example.com in
+    # the browser (live log 2026-10-25). Two well-known public endpoints, a short timeout.
+    INTERNET_PROBES = (("1.1.1.1", 443), ("8.8.8.8", 53))
+    PROBE_TIMEOUT = 1.5
 
     def _execute_get_system_info(self, call: ToolCall, *, approval_granted: bool = False) -> ToolResult:
         return self.execute(call, approval_granted=approval_granted)
@@ -22,6 +28,9 @@ class SystemCapability:
         return self.execute(call, approval_granted=approval_granted)
 
     def _execute_get_battery_status(self, call: ToolCall, *, approval_granted: bool = False) -> ToolResult:
+        return self.execute(call, approval_granted=approval_granted)
+
+    def _execute_get_network_status(self, call: ToolCall, *, approval_granted: bool = False) -> ToolResult:
         return self.execute(call, approval_granted=approval_granted)
 
     def execute(self, call: ToolCall, *, approval_granted: bool = False) -> ToolResult:
@@ -36,6 +45,9 @@ class SystemCapability:
             elif action == "get_system_status":
                 data = self._system_status()
                 readable = self._status_text(data)
+            elif action == "get_network_status":
+                data = self._network()
+                readable = self._network_text(data)
             else:
                 return ToolResult(call_id=call.call_id, name=action, success=False, error=f"Unsupported system action: {action}")
         except Exception as exc:
@@ -111,6 +123,74 @@ class SystemCapability:
             "battery": cls._battery(),
         })
         return status
+
+    @classmethod
+    def _reachable(cls) -> bool:
+        for host, port in cls.INTERNET_PROBES:
+            try:
+                with socket.create_connection((host, port), timeout=cls.PROBE_TIMEOUT):
+                    return True
+            except OSError:
+                continue
+        return False
+
+    @staticmethod
+    def _resolves(name: str = "www.google.com", timeout: float = 2.0) -> bool:
+        """DNS works (getaddrinfo has no timeout of its own, so it runs on a thread)."""
+        result: list[bool] = []
+
+        def lookup() -> None:
+            try:
+                socket.getaddrinfo(name, 443)
+                result.append(True)
+            except OSError:
+                result.append(False)
+
+        thread = threading.Thread(target=lookup, daemon=True)
+        thread.start()
+        thread.join(timeout)
+        return bool(result and result[0])
+
+    @staticmethod
+    def _wifi_name() -> str | None:
+        if os.name != "nt":
+            return None
+        try:
+            out = subprocess.run(["netsh", "wlan", "show", "interfaces"], capture_output=True, text=True, timeout=3,
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+        for line in out.splitlines():
+            key, _, value = line.partition(":")
+            if key.strip() == "SSID" and value.strip():
+                return value.strip()
+        return None
+
+    @classmethod
+    def _network(cls) -> dict[str, Any]:
+        psutil = cls._psutil()
+        adapters = sorted(
+            name for name, stats in psutil.net_if_stats().items()
+            if stats.isup and "loopback" not in name.casefold()
+        )
+        internet = cls._reachable()
+        return {
+            "internet": internet,
+            "dns": cls._resolves() if internet else False,
+            "wifi": cls._wifi_name(),
+            "adapters_up": adapters,
+        }
+
+    @staticmethod
+    def _network_text(data: dict[str, Any]) -> str:
+        via = f' through Wi-Fi "{data["wifi"]}"' if data.get("wifi") else ""
+        if data.get("internet") and data.get("dns"):
+            return f"Yes, the internet is connected{via}."
+        if data.get("internet"):
+            return f"The network reaches the internet{via}, but web addresses aren't resolving, so websites may not open."
+        if data.get("adapters_up"):
+            return f"No internet right now. The computer is on a network{via}, but it can't reach the internet."
+        return "No internet right now: no network connection is active (Wi-Fi off or cable unplugged)."
 
     @staticmethod
     def _gb(value: Any) -> str:

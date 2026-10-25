@@ -1,0 +1,30 @@
+{
+  "seed": 20261023,
+  "dev": [
+    "advi-open-site",
+    "waa-list-png",
+    "advi-find-file",
+    "waa-zip-backup",
+    "advi-create-folder",
+    "advi-rename-file",
+    "advi-write-file",
+    "waa-notepad-count",
+    "advi-word-pdf"
+  ],
+  "test": [
+    "advi-site-search",
+    "waa-hide-file",
+    "advi-copy-file",
+    "waa-large-files-report",
+    "waa-remove-empty",
+    "advi-read-file",
+    "waa-archive-docx",
+    "advi-move-pdfs",
+    "waa-move-folder",
+    "advi-organize",
+    "advi-whatsapp-confirm",
+    "waa-notepad-draft",
+    "advi-battery",
+    "advi-word-table"
+  ]
+}

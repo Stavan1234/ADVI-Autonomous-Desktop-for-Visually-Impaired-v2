@@ -614,6 +614,29 @@ class GroqProvider(LLMProvider):
         return llm_response
 
 
+def _repair_generated_call(generated: str) -> dict | None:
+    """Recover a tool call whose JSON the model garbled.
+
+    Groq rejected 'Failed to parse tool call arguments as JSON' for
+    {"name": "play_media", "arguments": {"query":"it\\'s been a long long time",...}"}
+    (an invalid \\' escape and a stray quote), and the user heard "a bug on my
+    side" (log, 2026-10-23). The name and the arguments object are still clear.
+    """
+    import json
+    import re
+
+    text = generated.replace("\\'", "'")
+    name = re.search(r'"name"\s*:\s*"([A-Za-z_][A-Za-z0-9_.:-]*)"', text)
+    start = re.search(r'"(?:arguments|parameters)"\s*:\s*(?={)', text)
+    if not name or not start:
+        return None
+    try:
+        arguments, _end = json.JSONDecoder().raw_decode(text, start.end())
+    except ValueError:
+        return None
+    return {"name": name.group(1), "arguments": arguments} if isinstance(arguments, dict) else None
+
+
 def _with_failed_call(error: LLMRequestError, exc: Exception) -> LLMRequestError:
     """Attach the model's rejected tool call (Groq's ``failed_generation``) as data.
 
@@ -632,7 +655,9 @@ def _with_failed_call(error: LLMRequestError, exc: Exception) -> LLMRequestError
     try:
         data = json.loads(generated)
     except ValueError:
-        return error
+        data = _repair_generated_call(generated)
+        if data is None:
+            return error
     if isinstance(data, list) and len(data) == 1:
         data = data[0]
     if not isinstance(data, dict) or not isinstance(data.get("name"), str):

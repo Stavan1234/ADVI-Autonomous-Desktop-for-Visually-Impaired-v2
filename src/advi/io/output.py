@@ -1,11 +1,38 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 import re
 import threading
+import time
 
+from .console import print_line
 from .tts import PiperTTS
+
+
+_QUOTED_PATH = re.compile(r"[`\"'“‘]((?:[A-Za-z]:)?\\[^`\"'”’\n]+)[`\"'”’]")
+_BARE_PATH = re.compile(r"(?:[A-Za-z]:)?(?:\\[^\\\s`\"]+)+\\?|[^\\\s`\"]+(?:\\[^\\\s`\"]+)+")
+
+
+def _spoken_path(path: str) -> str:
+    """'C:\\Users\\HP\\Documents\\files for testing\\poem.txt' -> 'poem.txt in files for testing'."""
+    trail = re.search(r"[.,;:!?)]+$", path)
+    core = path[: trail.start()] if trail else path
+    parts = [p for p in re.split(r"[\\/]", core) if p and not re.fullmatch(r"[A-Za-z]:", p)]
+    if not parts:
+        return path
+    # "Desktop in HP" says nothing useful: the user's own profile folder is left out.
+    profile = len(parts) >= 3 and parts[-3].casefold() == "users" or len(parts) >= 2 and parts[-2].casefold() == "users"
+    spoken = parts[-1] if len(parts) < 2 or profile else f"{parts[-1]} in {parts[-2]}"
+    return spoken + (trail.group(0) if trail else "")
+
+
+def speakable_paths(text: str) -> str:
+    """Read Windows paths as 'file in folder' instead of 'C colon backslash Users backslash...'
+    ("Backslash, backslash, backslash" came back through the microphone, live log 2026-10-25)."""
+    text = _QUOTED_PATH.sub(lambda m: _spoken_path(m.group(1)), text)
+    return _BARE_PATH.sub(lambda m: _spoken_path(m.group(0)), text)
 
 
 @dataclass(frozen=True)
@@ -22,6 +49,17 @@ class AdviResponse:
 
         if not text:
             return ""
+
+        # Spoken confirmations are short: a blind user waits for the whole sentence
+        # before answering (third live session, 2026-10-24). The screen keeps the full text.
+        confirm = re.match(
+            r"^(?:Thanks\.\s+)?Before I (?:do that|try again), I need your confirmation:\s*(?P<action>.+?)\.?\s+"
+            r"Say yes to (?:continue|send it) or no to cancel\.?$",
+            text, re.S,
+        )
+        if confirm:
+            action = confirm.group("action").strip()
+            return f"Shall I {action[0].lower() + action[1:]}? Yes or no?"
 
         # Remove fenced code blocks entirely for speech.
         text = re.sub(r"```(?:\w+)?\s*\n.*?\n```", "", text, flags=re.DOTALL)
@@ -119,6 +157,8 @@ class AdviResponse:
 
         result = " ".join(spoken_parts)
 
+        result = speakable_paths(result)
+
         # Avoid speaking raw URLs.
         result = re.sub(
             r"https?://\S+",
@@ -149,6 +189,86 @@ class OutputManager:
         # trails behind what ADVI is actually doing.
         self._narration_generation = 0
         self._last_narration: str | None = None
+        # Voice barge-in: speech queued before silence() is dropped, not spoken late.
+        self._silence_generation = 0
+        self._pending_speech = 0
+        # What ADVI said recently, so the microphone can tell its own voice from the user's.
+        self.recent_speech: deque[tuple[float, str]] = deque(maxlen=8)
+        self.last_quiet_at = 0.0
+
+    def remember_spoken(self, text: str) -> None:
+        self.recent_speech.append((time.monotonic(), str(text or "")))
+
+    def spoken_recently(self, seconds: float = 20.0) -> str:
+        now = time.monotonic()
+        return " ".join(text for at, text in list(self.recent_speech) if now - at <= seconds)
+
+    def _submit_speech(self, worker) -> None:
+        with self._state_lock:
+            generation = self._silence_generation
+            self._pending_speech += 1
+
+        def run() -> None:
+            try:
+                with self._state_lock:
+                    if generation != self._silence_generation:
+                        return
+                worker()
+            finally:
+                with self._state_lock:
+                    self._pending_speech -= 1
+                    if self._pending_speech <= 0:
+                        self.last_quiet_at = time.monotonic()
+
+        try:
+            self._speech_executor.submit(run)
+        except RuntimeError:
+            with self._state_lock:
+                self._pending_speech -= 1
+            raise
+
+    def silence(self) -> None:
+        """Stop talking now and drop anything queued (the user wants to speak)."""
+        self.stop_progress()
+        with self._state_lock:
+            self._silence_generation += 1
+            self._narration_generation += 1
+        if self.tts is not None:
+            stop = getattr(self.tts, "stop", None)
+            if callable(stop):
+                stop()
+
+    def pause_speech(self) -> None:
+        """Hold ADVI's speech while it is unclear whether the user is talking; silence() if it can't pause."""
+        pause = getattr(self.tts, "pause", None)
+        if not (callable(pause) and pause()):
+            self.silence()
+
+    def resume_speech(self) -> None:
+        resume = getattr(self.tts, "resume", None)
+        if callable(resume):
+            resume()
+
+    def is_quiet(self) -> bool:
+        with self._state_lock:
+            if self._pending_speech > 0:
+                return False
+        speaking = getattr(self.tts, "is_speaking", None)
+        return not (callable(speaking) and speaking())
+
+    def wait_quiet(self, timeout: float = 30.0) -> bool:
+        """Block until ADVI has finished speaking, so the microphone never hears it."""
+        import time
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.is_quiet():
+                return True
+            time.sleep(0.05)
+        return self.is_quiet()
+
+    def say(self, text: str) -> None:
+        self.deliver(AdviResponse(text), display=True)
 
     def close(self) -> None:
         """Release output-channel resources without racing background feedback."""
@@ -156,7 +276,9 @@ class OutputManager:
             if self._closed:
                 return
             self._closed = True
-        self.stop_progress()
+        # Whatever is still being said is cut: closing mid-answer waited for the whole
+        # answer (38 s measured, 2026-10-25). The goodbye was already waited for in app.py.
+        self.silence()
         # Every actual TTS invocation goes through this one executor. Waiting here
         # therefore guarantees no speech call is still using the TTS backend when
         # it is closed below.
@@ -181,6 +303,7 @@ class OutputManager:
                     if self._closed or stop.is_set() or generation != self._progress_generation or self.tts is None:
                         return
                 try:
+                    self.remember_spoken(message)
                     self.tts.speak(message)
                 except Exception as exc:
                     import logging
@@ -193,7 +316,7 @@ class OutputManager:
                 if self._closed or stop.is_set() or generation != self._progress_generation or self.tts is None:
                     return
             try:
-                self._speech_executor.submit(speak_worker)
+                self._submit_speech(speak_worker)
             except RuntimeError:
                 return
 
@@ -213,7 +336,7 @@ class OutputManager:
             generation = self._narration_generation
         # A concrete step replaces the generic "Working on that."
         self.stop_progress()
-        print(f"  ... {message}")
+        print_line(f"  ... {message}")
         if self.tts is None:
             return
 
@@ -223,13 +346,14 @@ class OutputManager:
                     if self._closed or generation != self._narration_generation or self.tts is None:
                         return
                 try:
+                    self.remember_spoken(message)
                     self.tts.speak(message)
                 except Exception as exc:
                     import logging
                     logging.getLogger(__name__).warning("Progress narration failed: %s", exc)
 
         try:
-            self._speech_executor.submit(speak_worker)
+            self._submit_speech(speak_worker)
         except RuntimeError:
             pass
 
@@ -258,7 +382,7 @@ class OutputManager:
         display_text = response.for_display()
 
         if display and display_text:
-            print(f"Advi: {display_text}")
+            print_line(f"Advi: {display_text}")
 
         # Text output succeeded even when voice is unavailable.
         if self.tts is None:
@@ -281,13 +405,14 @@ class OutputManager:
         def speak_worker() -> None:
             with self._speech_lock:
                 try:
+                    self.remember_spoken(speech_text)
                     self.tts.speak(speech_text)
                 except Exception as exc:
                     import logging
                     logging.getLogger(__name__).warning("Speech output failed: %s", exc)
 
         try:
-            self._speech_executor.submit(speak_worker)
+            self._submit_speech(speak_worker)
         except RuntimeError:
             pass
         return bool(display_text)

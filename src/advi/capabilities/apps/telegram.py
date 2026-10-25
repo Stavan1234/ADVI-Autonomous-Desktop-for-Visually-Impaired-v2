@@ -56,6 +56,49 @@ def _shows(screen_text: str, wanted: str) -> bool:
     return bool(wanted_key) and wanted_key in _squash(screen_text)
 
 
+def _chat_header_ok(header: str, chat: str, header_before: str) -> bool:
+    """The conversation header names the chat, or changed after Enter.
+
+    Searching your own name opens "Saved Messages", whose header never shows
+    the name, so ADVI said it couldn't confirm a chat that had opened (log,
+    2026-10-23). A changed header is checked further against the message box.
+    """
+    if _shows(header, chat):
+        return True
+    now = _squash(header)
+    return bool(now) and now != header_before
+
+
+_LIST_TAIL = re.compile(r"\s+(?:\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}|\d{1,2}:\d{2}|mon|tue|wed|thu|fri|sat|sun)\b.*$", re.I)
+
+
+def _top_result_title(listing: str, chat: str) -> str | None:
+    """The first search-result row that matches, without its date or time."""
+    for line in str(listing or "").splitlines():
+        if _shows(line, chat):
+            title = _LIST_TAIL.sub("", line).strip(" .,:;|")
+            return title or None
+    return None
+
+
+def _header_ends_title(header: str, title: str | None) -> bool:
+    """The header's first line is the end of the top result's title.
+
+    At an 800-pixel window the header box starts a little right of the title,
+    so OCR read "n Jio" for "Stavan Jio" (live, 2026-10-23). A widened box
+    would catch the search field, which echoes the query.
+    """
+    if not title:
+        return False
+    first = next((line for line in str(header or "").splitlines() if line.strip()), "")
+    tail = _squash(first)
+    return len(tail) >= 3 and _squash(title).endswith(tail)
+
+
+def _composer_placeholder(screen_text: str) -> bool:
+    return "writeamessage" in _squash(screen_text)
+
+
 def _no_results(screen_text: str) -> bool:
     # 'No Results / There were no results for "<query>"' echoes the query.
     return "noresults" in _squash(screen_text)
@@ -116,17 +159,41 @@ class TelegramSkill:
             self.screen.keys("{ESC}{ESC}")
             self.sleep(0.3)
             self.screen.type(chat)
-            found, _ = self._wait_for(regions["list"], lambda seen: _shows(seen, chat) and not _no_results(seen), 3.0)
+            found, listing = self._wait_for(regions["list"], lambda seen: _shows(seen, chat) and not _no_results(seen), 3.0)
             if not found:
                 self.screen.keys("{ESC}")
                 raise StepFailed("search", f"I couldn't find a Telegram chat called {chat}.")
+            top = _top_result_title(listing, chat)
+            header_before = _squash(self.screen.read(regions["header"]))
             self.screen.keys("{ENTER}")
-            opened, _ = self._wait_for(regions["header"], lambda seen: _shows(seen, chat), 3.0)
+            opened, header = self._wait_for(regions["header"], lambda seen: _chat_header_ok(seen, chat, header_before), 3.0)
             if not opened:
                 raise StepFailed("chat_opened", f"I searched Telegram for {chat} but couldn't confirm that chat opened, so I stopped.")
-            evidence["chat_title"] = chat
+            named = _shows(header, chat) or _header_ends_title(header, top)
+            if named:
+                title = top or chat
+            elif _shows(header, "saved messages"):
+                title = "Saved Messages"
+            else:
+                title = chat
+                # Header changed to a chat whose title OCR couldn't match; only an
+                # open chat has a message box, so require it before going on.
+                ready, _ = self._wait_for(regions["composer"], _composer_placeholder, 2.0)
+                if not ready:
+                    raise StepFailed("chat_opened", f"I searched Telegram for {chat} but couldn't confirm that chat opened, so I stopped.")
+            evidence["chat_title"] = title
+            evidence["title_confirmed"] = named
             if text is None:
-                return SkillOutcome(True, "chat_opened", f"Opened the Telegram chat with {chat}.", evidence)
+                if not named and title != chat:
+                    return SkillOutcome(True, "chat_opened", f"Searching for {chat} opened {title} on Telegram.", evidence)
+                if not named:
+                    return SkillOutcome(True, "chat_opened", f"Opened the top Telegram result for {chat}; I couldn't read its name to double-check.", evidence)
+                return SkillOutcome(True, "chat_opened", f"Opened the Telegram chat with {title}.", evidence)
+            if not named:
+                # The user confirmed a message *to {chat}*; never send it to a chat
+                # whose header doesn't say so.
+                opened_as = title if title != chat else "a chat whose name I couldn't read"
+                raise StepFailed("chat_opened", f"Searching Telegram for {chat} opened {opened_as}, so I didn't send anything. Tell me the exact chat name to use.")
 
             self.screen.type(text)
             typed = True

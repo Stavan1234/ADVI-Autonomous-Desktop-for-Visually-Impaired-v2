@@ -745,6 +745,40 @@ class GmailService:
         trace("gmail.reply.response", success=True, in_reply_to=message_id, message_id=response.get("id"), thread_id=response.get("threadId"))
         return response
 
+    def modify_labels(self, message_id: str, *, add: list[str] | None = None, remove: list[str] | None = None) -> dict:
+        """Add/remove labels: archive = remove INBOX; mark read = remove UNREAD."""
+        message_id = (message_id or "").strip()
+        if not message_id:
+            raise ValueError("Message ID cannot be empty.")
+        body = {"addLabelIds": list(add or []), "removeLabelIds": list(remove or [])}
+        trace("gmail.modify.request", source_component="GmailService", message_id=message_id, **body)
+        response = self._service.users().messages().modify(userId="me", id=message_id, body=body).execute()
+        trace("gmail.modify.response", success=True, message_id=message_id, labels=response.get("labelIds"))
+        return response
+
+    def trash_message(self, message_id: str) -> dict:
+        """Move one message to Trash (Gmail keeps it there for 30 days; never a permanent delete)."""
+        message_id = (message_id or "").strip()
+        if not message_id:
+            raise ValueError("Message ID cannot be empty.")
+        trace("gmail.trash.request", source_component="GmailService", message_id=message_id)
+        response = self._service.users().messages().trash(userId="me", id=message_id).execute()
+        trace("gmail.trash.response", success=True, message_id=message_id, labels=response.get("labelIds"))
+        return response
+
+    def forward_message(self, message_id: str, to: str, note: str = "") -> dict:
+        """Forward one message's text to ``to``, with an optional note on top."""
+        original = self.get_parsed_message(message_id)
+        to = self._validate_email_address(to)
+        subject = str(original.subject or "").strip()
+        subject = subject if subject.lower().startswith("fwd:") else f"Fwd: {subject}"
+        quoted = (
+            f"---------- Forwarded message ---------\nFrom: {original.sender}\nDate: {original.date}\n"
+            f"Subject: {original.subject}\nTo: {original.recipients}\n\n{original.body}"
+        )
+        body = f"{note.strip()}\n\n{quoted}" if note and note.strip() else quoted
+        return self.send_email(to=to, subject=subject, body=body)
+
     def send_email(self, to: str, subject: str, body: str) -> dict:
         """Create and immediately send one message via Gmail messages.send."""
         to = self._validate_email_address(to)

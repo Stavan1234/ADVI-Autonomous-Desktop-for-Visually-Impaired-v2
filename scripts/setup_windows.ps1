@@ -21,6 +21,24 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "$pyVersion" -ForegroundColor Green
 
+# PyTorch (used for the memory embeddings) installs files up to ~145 characters deep
+# inside .venv. Without Windows long-path support, a project folder longer than about
+# 100 characters makes pip fail with "No such file or directory" after minutes of
+# downloads (seen in a fresh-copy test, 2026-10-25; a GitHub ZIP extracted into
+# Downloads gives a ~135-character path). Check up front and explain.
+$longPaths = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name LongPathsEnabled -ErrorAction SilentlyContinue).LongPathsEnabled
+if ($ProjectRoot.Length -gt 100 -and $longPaths -ne 1) {
+    Write-Host ""
+    Write-Host "The ADVI folder path is $($ProjectRoot.Length) characters long:" -ForegroundColor Red
+    Write-Host "    $ProjectRoot" -ForegroundColor Red
+    Write-Host "Windows limits paths to 260 characters unless long paths are enabled, and the" -ForegroundColor Yellow
+    Write-Host "PyTorch package needs a project folder of at most 100 characters. Either:" -ForegroundColor Yellow
+    Write-Host "  1. move the folder to a short path such as C:\ADVI and run SETUP_ADVI.bat again, or" -ForegroundColor Yellow
+    Write-Host "  2. enable long paths (needs administrator rights), restart, and run setup again:" -ForegroundColor Yellow
+    Write-Host '     New-ItemProperty -Path HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem -Name LongPathsEnabled -Value 1 -PropertyType DWORD -Force' -ForegroundColor Yellow
+    throw "Project path too long for a Windows installation without long-path support."
+}
+
 $venvPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 if (-not (Test-Path $venvPython)) {
     Write-Host "Creating .venv..." -ForegroundColor Yellow
@@ -41,6 +59,24 @@ if (-not (Test-Path ".env")) {
     Write-Host "Created .env from .env.example. Add at least one provider API key." -ForegroundColor Yellow
 } else {
     Write-Host ".env already exists; leaving it untouched." -ForegroundColor Green
+}
+
+Write-Host "Downloading the offline speech model (about 320 MB, once)..." -ForegroundColor Yellow
+# Voice works offline with this local Whisper model; online, Groq's Whisper is used instead.
+# A failure here is not fatal: ADVI tries the download again on its first start.
+& $venvPython -c "from pathlib import Path; from advi.voice.transcriber import LocalTranscriber, DEFAULT_STT_MODEL; import sys; sys.exit(0 if LocalTranscriber(DEFAULT_STT_MODEL, download_root=Path('assets/whisper')).preload() else 1)"
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "Offline speech model: OK" -ForegroundColor Green
+} else {
+    Write-Host "Offline speech model: NOT DOWNLOADED (no internet?). ADVI will retry on first start; typing always works." -ForegroundColor Yellow
+}
+
+Write-Host "Downloading the wake-word model (about 75 MB, once)..." -ForegroundColor Yellow
+& $venvPython -c "from pathlib import Path; from advi.voice.transcriber import LocalTranscriber; from advi.wake.listener import WAKE_MODEL; import sys; sys.exit(0 if LocalTranscriber(WAKE_MODEL, download_root=Path('assets/whisper')).preload() else 1)"
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "Wake-word model: OK" -ForegroundColor Green
+} else {
+    Write-Host "Wake-word model: NOT DOWNLOADED (no internet?). The wake listener retries every minute." -ForegroundColor Yellow
 }
 
 $assetChecks = @(
@@ -85,8 +121,28 @@ if ($LASTEXITCODE -ne 0) { throw "Source compilation failed." }
 Write-Host "Running the current ADVI regression suite..." -ForegroundColor Yellow
 # test_groq_smoke.py calls the real Groq API; it is skipped here so a missing or
 # not-yet-added key cannot fail the installation.
-& $venvPython -m pytest -q --deselect tests/current/test_groq_smoke.py
+# pyproject.toml already adds -q; another -q would hide the "N passed" summary.
+& $venvPython -m pytest --deselect tests/current/test_groq_smoke.py
 if ($LASTEXITCODE -ne 0) { throw "ADVI regression tests failed. Fix the failing test(s) before using the installation." }
+
+# The wake word: a background listener started at every Windows sign-in (HKCU Run,
+# no administrator rights), so "wake up ADVI" starts ADVI even when it is closed.
+# ADVI_WAKE=off in .env (or the environment) skips this.
+$wakeSetting = $env:ADVI_WAKE
+if (-not $wakeSetting -and (Test-Path ".env")) {
+    $line = Select-String -Path ".env" -Pattern '^\s*ADVI_WAKE\s*=\s*(\S*)' | Select-Object -First 1
+    if ($line) { $wakeSetting = $line.Matches[0].Groups[1].Value }
+}
+if ($wakeSetting -and @("0", "off", "false", "no") -contains $wakeSetting.ToLower()) {
+    Write-Host "Wake word: off (ADVI_WAKE=off)." -ForegroundColor Yellow
+} else {
+    & $venvPython -m advi.wake install
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Wake word: ON. Say 'wake up ADVI' to start ADVI. Remove: .venv\Scripts\python.exe -m advi.wake uninstall" -ForegroundColor Green
+    } else {
+        Write-Host "Wake word: could not be registered; start ADVI with run_advi.bat." -ForegroundColor Yellow
+    }
+}
 
 Write-Host "" 
 Write-Host "ADVI installation and source validation complete." -ForegroundColor Green

@@ -11,7 +11,7 @@ from typing import Any, Callable, Iterable
 from collections import deque
 from pathlib import Path
 
-from advi.core import progress
+from advi.core import cancel, progress
 from advi.core.context_router import ContextRouter
 from advi.core.action_contracts import validate_and_normalize_tool_call
 from advi.core.personality import build_advi_system_prompt
@@ -54,6 +54,7 @@ from advi.core.pipeline_trace import (
 from .contracts import ExecutionDomain, ExecutionRoute, TaskState, TaskStatus
 from .turns import TurnKind, classify_turn
 from .local_intents import LocalIntent, match_local_intent
+from .names import corrected_name, corrected_text, replace_word, resolve_chat, spelled_names, word_correction
 
 logger = logging.getLogger(__name__)
 from .provider_session import ProviderSessionManager
@@ -154,6 +155,7 @@ _TOOL_DOMAIN: dict[str, str] = {
     "list_windows": ExecutionDomain.DESKTOP.value,
     "inspect_window": ExecutionDomain.DESKTOP.value,
     "read_screen": ExecutionDomain.DESKTOP.value,
+    "look_at_screen": ExecutionDomain.DESKTOP.value,
     "type_text": ExecutionDomain.DESKTOP.value,
     "press_key": ExecutionDomain.DESKTOP.value,
     "hotkey": ExecutionDomain.DESKTOP.value,
@@ -191,9 +193,12 @@ _TOOL_DOMAIN: dict[str, str] = {
     "undo_file_operation": ExecutionDomain.FILESYSTEM.value,
     "delete_file": ExecutionDomain.FILESYSTEM.value,
     "copy_file": ExecutionDomain.FILESYSTEM.value,
+    "zip_files": ExecutionDomain.FILESYSTEM.value,
+    "set_file_hidden": ExecutionDomain.FILESYSTEM.value,
     "move_file": ExecutionDomain.FILESYSTEM.value,
     "rename_file": ExecutionDomain.FILESYSTEM.value,
     "delete_folder": ExecutionDomain.FILESYSTEM.value,
+    "remove_empty_folders": ExecutionDomain.FILESYSTEM.value,
     "copy_folder": ExecutionDomain.FILESYSTEM.value,
     "move_folder": ExecutionDomain.FILESYSTEM.value,
     "rename_folder": ExecutionDomain.FILESYSTEM.value,
@@ -204,10 +209,15 @@ _TOOL_DOMAIN: dict[str, str] = {
     "email_draft_update": ExecutionDomain.GMAIL.value,
     "email_send": ExecutionDomain.GMAIL.value,
     "email_reply": ExecutionDomain.GMAIL.value,
+    "email_forward": ExecutionDomain.GMAIL.value,
+    "email_trash": ExecutionDomain.GMAIL.value,
+    "email_archive": ExecutionDomain.GMAIL.value,
+    "email_mark": ExecutionDomain.GMAIL.value,
     "contact_lookup": ExecutionDomain.GMAIL.value,
     "get_system_info": ExecutionDomain.SYSTEM.value,
     "get_system_status": ExecutionDomain.SYSTEM.value,
     "get_battery_status": ExecutionDomain.SYSTEM.value,
+    "get_network_status": ExecutionDomain.SYSTEM.value,
     "memory_search": ExecutionDomain.MEMORY.value,
     "memory_retrieval": ExecutionDomain.MEMORY.value,
 }
@@ -218,12 +228,32 @@ _NATIVE_SIDE_EFFECT_TOOLS = {
     "type_text", "press_key", "hotkey", "click", "double_click", "right_click", "scroll",
     "navigate", "search", "click_web_element", "type_web_element", "go_back", "go_forward", "reload_page",
     "create_file", "save_file", "append_file", "replace_file_text", "open_file", "open_folder",
-    "create_folder", "delete_file", "copy_file", "move_file", "rename_file", "delete_folder",
+    "create_folder", "delete_file", "copy_file", "move_file", "rename_file", "delete_folder", "remove_empty_folders",
     "copy_folder", "move_folder", "rename_folder", "email_draft_create", "email_draft_update",
     "email_send", "email_reply", "whatsapp_send_message", "whatsapp_open_chat", "play_media", "interact",
-    "telegram_send_message", "telegram_open_chat",
+    "telegram_send_message", "telegram_open_chat", "email_forward", "email_trash", "email_archive", "email_mark",
     "move_files", "organize_folder", "undo_file_operation",
 }
+
+# Automatic looks with the vision model per task. Structure (UIA, the DOM, OCR)
+# is the primary sense; vision answers only what structure cannot.
+_VISION_BUDGET = 2
+# Window chrome alone (minimize, maximize, close, system menu): UIA sees no content.
+_BLIND_ELEMENT_COUNT = 4
+# Moving around a website without changing anything on it.
+_BROWSING_TOOLS = frozenset({"open_browser", "navigate", "search", "click_web_element", "go_back", "go_forward", "reload_page"})
+# Typing into a site's search box that lands on a results page changes nothing; the
+# answer read from those results was replaced by "couldn't verify the final state:
+# Extracted 3059 characters" (capability sweep, 2026-10-25). Typing that goes anywhere
+# else (a comment, a form) still counts as a change.
+_SEARCH_RESULTS_URL = re.compile(r"now at \S*(?:/search\b|/s\?|/results\?|[?&](?:q|k|query|search_query|search)=)", re.I)
+# Reading mail, drafts, contacts or system facts changes nothing either; "check my inbox"
+# was answered "couldn't verify the final state: Read 1 email" (live log 2026-10-24).
+_READ_ONLY_TOOLS = frozenset({
+    "email_read", "email_draft_read", "contact_lookup", "get_battery_status", "get_system_status", "get_network_status",
+    "get_system_info", "memory_recall", "memory_search", "research_web",
+})
+_NO_VISION_TOOLS = frozenset({"media_control", "press_key", "hotkey", "wait"})
 
 _FILE_EXTENSIONS = ("pdf", "docx", "pptx", "xlsx", "txt", "csv", "md", "rtf", "json", "xml")
 
@@ -252,12 +282,12 @@ Rules:
 - Work as observe, act, verify. One state-changing step at a time when the situation is unfamiliar; re-observe when reality differs. Never repeat a side effect whose result is uncertain.
 - Each turn declares only some tools. If you need one that is not declared, call request_tools with its exact name first. Never say ADVI cannot do something request_tools lists.
 - Writing (speech, sermon, poem, essay, letter): compose the full text yourself; ask only if the topic is unclear.
-- Files: use native file tools, not the GUI. Use folder aliases or paths returned by tools; never invent a C:\\Users username. list_files / find_file to locate (partial matches need a sensible pick or a question). Many files at once: move_files or organize_folder (never one move_file per file); both undo with undo_file_operation, so tell the user they can say "undo". Documents: create_file makes real PDF/DOCX/XLSX/PPTX; pass pages/slides when the user gives a count.
-- Apps: "app/application/desktop" in an open request means the desktop app (find_application / open_application), never a website. list_applications for the installed list. Operate an app with observe_window, then interact by element ID; re-read the fresh observation after each step. read_screen only reads text; click/type_text only when no element fits.
+- Files: use native file tools, not the GUI. To count a word or lines in a file, use search_file_content (it counts exactly); never count by reading. Check facts about files yourself (which folders are empty, sizes, newest) with list_files; never ask the user for something a tool can look up. Use folder aliases or paths returned by tools; never invent a C:\\Users username. list_files / find_file to locate (partial matches need a sensible pick or a question). Many files at once: move_files or organize_folder (never one move_file per file); both undo with undo_file_operation, so tell the user they can say "undo". Documents: create_file makes real PDF/DOCX/XLSX/PPTX; pass pages/slides when the user gives a count.
+- Apps: "app/application/desktop" in an open request means the desktop app (find_application / open_application), never a website. list_applications for the installed list. Operate an app with observe_window, then interact by element ID; re-read the fresh observation after each step. read_screen only reads text; look_at_screen answers a question about what the screen shows when structure shows nothing useful or you are unsure (never click from it, and never treat it as proof the task succeeded); click/type_text only when no element fits.
 - Word / MS Word: word_create_document with the complete text (headings, bullets, tables) and the save path; it opens Word itself. Never type a document into Word with type_text.
-- WhatsApp / Telegram: whatsapp_* or telegram_send_message / telegram_open_chat with the chat name and the exact dictated text; never drive them with clicks or keys.
+- WhatsApp / Telegram: call whatsapp_* or telegram_send_message / telegram_open_chat directly with the chat name exactly as the user said it and the exact dictated text. Never use contact_lookup or email contacts for chats and never ask for the "exact" name first: the tool searches the app and reports matches. Never drive them with clicks or keys. Never say a message was sent unless the send tool succeeded.
 - Media: a file on this computer (in a folder, on the laptop, or just listed) -> play_local_media. YouTube / YouTube Music -> play_media once (service=youtube_music for YouTube Music); it verifies playback.
-- Websites: open_browser or navigate, then inspect_web_page for refs, then click_web_element / type_web_element with a ref as selector (submit=true to search). Each action returns a fresh snapshot; use its refs, never old ones. Players in iframes have refs like f1e2. For Chrome or "the browser" use open_browser, never open_application.
+- Websites: open_browser or navigate, then inspect_web_page for refs, then click_web_element / type_web_element with a ref as selector (submit=true to search). Each action returns a fresh snapshot; use its refs, never old ones. Players in iframes have refs like f1e2. For Chrome or "the browser" use open_browser, never open_application. To find things on a site (products, articles), use search once, then answer from the results it returns (3-5 items with prices or key details); read_web_page with start for more. Never repeat the same search.
 - Email: contact_lookup first for a named recipient and use only the returned address; if none or several, ask. Never guess addresses. Truncated bodies are partial, not missing. If Gmail returns fallback_recommended, continue through david_fallback with the same recipient, subject, body and draft_id. Use david_fallback only when native tools cannot do the task.
 - Keep replies short and speech-friendly; explain failures concretely.
 """.strip()
@@ -271,6 +301,7 @@ Rules:
         self.execution_controller = ExecutionController()
         self.perception_controller = PerceptionController()
         self.provider_manager = ProviderSessionManager(providers)
+        self.provider_manager.wait_notice = self._announce_short_wait
         self.max_tool_rounds = max(1, int(max_tool_rounds))
         self.session_buffer = session_buffer
         self.runtime = runtime
@@ -713,6 +744,15 @@ Rules:
             send_request = any_of("send", "sending", "send it", "compose", "write an email")
             if read_email_request:
                 add("email_read")
+            # Forward / delete / archive / mark act on a message found with email_read.
+            if any_of("forward"):
+                add("email_read", "email_forward", "contact_lookup")
+            if re.search(r"\b(?:delete|trash|remove|bin)\b", lower):
+                add("email_read", "email_trash")
+            if any_of("archive"):
+                add("email_read", "email_archive")
+            if re.search(r"\b(?:mark|unread|star|starred|unstar)\b", lower):
+                add("email_read", "email_mark")
             if email_from_message_request:
                 add("email_read")
                 selected.discard("contact_lookup")
@@ -1052,6 +1092,25 @@ Rules:
             add("open_application", "new_document", "list_windows", "inspect_window", "focus_window", "type_text", "press_key", "hotkey", "save_document", "save_document_as", "close_document", "wait", "read_screen")
         if any_of("screen", "ocr", "read screenshot", "read the screen", "screenshot"):
             add("read_screen", "inspect_window", "list_windows")
+        if any_of("zip", "compress", "archive"):
+            add("zip_files", "list_files")
+        if any_of("hide", "hidden", "unhide"):
+            add("set_file_hidden", "find_file")
+        if any_of("empty folder", "empty folders", "empty directories", "empty subfolders"):
+            add("remove_empty_folders", "list_files")
+        # "Which is the largest file in X?" got no file tool at all (capability sweep, 2026-10-24).
+        if re.search(r"\b(?:largest|biggest|smallest|heaviest|newest|oldest|latest|most recent|recently)\b.{0,30}\bfiles?\b", lower) \
+                or re.search(r"\bfiles?\b.{0,40}\b(?:largest|biggest|smallest|newest|oldest)\b", lower):
+            add("list_files", "find_file")
+        if re.search(r"\b(?:which|what) (?:file|document)\b.{0,60}\b(?:should|could|to)\b|\brecommend\b.{0,20}\bfile", lower):
+            add("list_files", "find_file", "read_file", "search_file_content")
+        if any_of("count", "how many times", "occurrence", "instances of", "number of times"):
+            add("search_file_content", "find_file")
+        if any_of(
+            "screen", "what do you see", "what can you see", "describe", "look at",
+            "is there an error", "what's showing", "what is showing", "what happened", "did it work",
+        ):
+            add("look_at_screen")
         # Browser/media targets are semantic web targets. Compute this before the
         # pointer-action branch so browser clicks never share a desktop-click surface.
         browserish = any_signal(
@@ -1171,9 +1230,10 @@ Rules:
             # Keep the small browser interaction cluster coherent. The model may
             # legitimately choose exact-selector typing after inspecting a page.
             # Do not advertise that behavior in the prompt while omitting its tool.
-            add("navigate", "search", "inspect_web_page", "click_web_element", "type_web_element", "wait")
-            if any_of("read the page", "read this page", "read the website", "read the article", "read this", "contents of the page", "page content"):
-                add("read_web_page")
+            # read_web_page is core: without it, "search a speaker on amazon"
+            # could see buttons but never the products, searched again, and ran
+            # out of steps (log, 2026-10-23).
+            add("navigate", "search", "inspect_web_page", "read_web_page", "click_web_element", "type_web_element", "wait")
             if any_of("type into", "enter into", "fill in", "fill out", "type this", "enter this", "write into", "search box", "search field"):
                 add("type_web_element")
             if re.search(r"\b(?:go back|back to the previous page|previous page)\b", lower, re.I):
@@ -1202,7 +1262,7 @@ Rules:
                 "email_draft_read": ("email_draft_update", "email_send"),
                 "email_draft_update": ("email_draft_read", "email_send"),
                 "contact_lookup": ("email_draft_create", "email_read", "email_send"),
-                "email_read": ("email_read", "email_reply"),
+                "email_read": ("email_read", "email_reply", "email_forward", "email_trash", "email_archive", "email_mark"),
                 "email_send": ("email_read"),
                 "email_reply": ("email_read"),
                 "find_file": ("read_file", "open_file", "open_folder"),
@@ -1542,6 +1602,74 @@ Rules:
                 self.task.waiting_for = None
                 self.task.status = TaskStatus.IN_PROGRESS
 
+    _NAME_RE = re.compile(
+        r"\b(?:my name is|my name's|call me)\s+(?P<name>[A-Za-z][A-Za-z'-]*(?:\s+(?!and\b|i\b|i'm\b|but\b)[A-Za-z][A-Za-z'-]*){0,2})",
+        re.I,
+    )
+    _ABOUT_RE = re.compile(
+        r"\b(?P<about>i(?:\s+am|'m)\s+(?:a|an|the|one of)\b[^.!?\n]{3,140}|i\s+(?:study|work|built|made|created|developed)\b[^.!?\n]{3,140})",
+        re.I,
+    )
+    _ABOUT_WORDS = ("student", "engineer", "developer", "member", "teacher", "work", "study", "studying",
+                    "built", "made", "created", "developed", "founder", "designer", "college", "university", "school")
+
+    def _persist_user_profile_facts(self, text: str) -> None:
+        """Remember who the user is when they say so.
+
+        "My name is Stavan Kalkumbe, I am an engineering student at FCRIT ..."
+        got "I'll remember that" with nothing saved, and "what do you know about
+        me" then listed file names (log, 2026-10-23).
+        """
+        if self.memory is None:
+            return
+        source = str(text or "")
+        saved = False
+        name_match = self._NAME_RE.search(source)
+        if name_match:
+            name = " ".join(word[:1].upper() + word[1:] for word in name_match.group("name").split())
+            saved |= self._remember_profile("name", name, f"The user's name is {name}.")
+        about = [
+            " ".join(match.group("about").split()).rstrip(" ,;")
+            for match in self._ABOUT_RE.finditer(source)
+            if any(word in match.group("about").casefold() for word in self._ABOUT_WORDS)
+        ]
+        if about:
+            previous = self._profile_value("about")
+            parts = [part for part in previous.split(" | ") if part] if previous else []
+            for item in about:
+                if item.casefold() not in {part.casefold() for part in parts}:
+                    parts.append(item)
+            value = " | ".join(parts)[-400:]
+            saved |= self._remember_profile("about", value, f"About the user: {value}.")
+        if saved:
+            self._last_memory_write_at = time.monotonic()
+
+    def _remember_profile(self, key: str, value: str, statement: str) -> bool:
+        try:
+            self.memory.remember(kind="user_profile", scope="user", subject="user", key=key,
+                                 value=value, statement=statement, confidence=0.95, importance=8)
+            return True
+        except Exception:
+            logger.debug("Could not persist user profile %s", key, exc_info=True)
+            return False
+
+    def _profile_value(self, key: str) -> str:
+        store = getattr(self.memory, "memory", None) if self.memory is not None else None
+        recall = getattr(store, "recall", None)
+        if not callable(recall):
+            return ""
+        try:
+            memory = recall("user_profile", key)
+        except Exception:
+            return ""
+        return str(getattr(memory, "value", "") or "").strip() if memory is not None else ""
+
+    def _user_profile_line(self) -> str:
+        name, about = self._profile_value("name"), self._profile_value("about")
+        if not name and not about:
+            return ""
+        return "[USER] " + "; ".join(part for part in (name, about) if part)
+
     def _resume_explicit_david_email(self, text: str) -> AdviResponse | None:
         """Resume an explicitly requested David-email task without another model routing decision."""
         if self.task is None or not self.task.context.get("fallback_requested"):
@@ -1808,17 +1936,22 @@ Rules:
 
         # Quoted text is the safest replacement representation. Otherwise accept
         # the remainder after the field/update marker for natural voice phrasing.
-        quoted = re.findall(r'["“](.*?)["”]', normalized, re.S)
-        if quoted:
-            value = quoted[-1].strip()
-        else:
-            field_pattern = r"(?:subject|body|message|recipient|email address|to)"
-            match = re.search(
-                rf"\b{field_pattern}\b\s*(?:to|as|with|:|that says|so it says)?\s*(?P<value>.+)$",
-                normalized, re.I | re.S,
-            )
-            value = match.group("value").strip(" \t\r\n.!?") if match else ""
+        value = AgentSession._email_edit_value(normalized)
         return (field, value) if value else None
+
+    @staticmethod
+    def _email_edit_value(text: str) -> str:
+        """The new value in "change the body of the email to X" (not "of the email to X")."""
+        quoted = re.findall(r'["“](.*?)["”]', text, re.S)
+        if quoted:
+            return quoted[-1].strip()
+        field = r"(?:subject|body|message|text|content|recipient|email address)"
+        of_email = r"(?:\s+(?:of|in|for)\s+(?:the|this|that|my)\s+(?:e-?mail|mail|message|draft))?"
+        marker = r"(?:to say|to read|to|as|with|into|that says|so it says|should say|should be|:)"
+        match = re.search(rf"\b{field}\b{of_email}\s*{marker}\s+(?P<value>.+)$", text, re.I | re.S) or re.search(
+            rf"\b{field}\b\s*(?P<value>.+)$", text, re.I | re.S)
+        value = match.group("value") if match else ""
+        return re.sub(r"\s*(?:please)?[\s.!?]*$", "", value.strip()).strip()
 
     @staticmethod
     def _is_local_email_send_request(text: str) -> bool:
@@ -1882,6 +2015,10 @@ Rules:
         self._ensure_active_task()
         assert self.task is not None
         was_sent = bool(state.get("sent"))
+        if was_sent and not re.search(r"\b(?:you|i|we)\s+(?:just\s+)?(?:sent|wrote|send|drafted)\b|\bdraft\b", text, re.I):
+            # After a send, "read out that email" / "read the top message" means the inbox,
+            # not the email ADVI sent (live log 2026-10-24 read the sent draft twice).
+            return None
         if was_sent:
             subject = state.get("subject") or "(no subject)"
             body = state.get("body") or "(empty)"
@@ -2095,6 +2232,8 @@ Rules:
         device = r"(?:system|computer|pc|laptop|machine|device)"
         if re.search(r"\b(?:battery|battery percentage|battery status|charge level)\b", lower):
             return "get_battery_status"
+        if re.search(r"\b(?:internet|online|wi-?fi|network connection|connected to (?:the )?(?:net|network))\b", lower):
+            return "get_network_status"
         if re.search(
             rf"\b(?:{device}\s+(?:info|information|specs?|specifications)|"
             r"(?:storage|disk\s+space|disk|free\s+space|space\s+left|drive\s+space|hard\s+drive|ssd)\b)",
@@ -2102,7 +2241,7 @@ Rules:
         ):
             return "get_system_info"
         if re.search(
-            rf"\b(?:{device}\s+(?:status|health|stats|usage)|"
+            rf"\b(?:{device}\s+(?:status|health|stats|usage)|(?:status|health) of (?:my |the |this )?{device}|"
             r"(?:cpu|ram|memory)\s+(?:usage|status|load)|how\s+is\s+my\s+(?:laptop|computer|pc))\b",
             lower,
         ):
@@ -2503,8 +2642,18 @@ Rules:
         self.task.status = TaskStatus.FAILED if result.verification_status != "uncertain" else TaskStatus.UNCERTAIN
         return AdviResponse(result.error or result.human_readable or "I couldn't verify that the prepared email was sent.")
 
+    def request_stop(self) -> None:
+        """Stop the running task at its next step (called from the voice thread)."""
+        self._stop_requested = True
+        cancel.STOP.set()  # long searches check this inside their loops
+
     def _respond_turn(self, text: str) -> AdviResponse:
+        self._turn_tools_run = 0
+        self._stop_requested = False
+        cancel.STOP.clear()
+        self._answered_pending_reply = False
         self._missing_tool_recovery_used = False
+        self._turn_started_at = time.monotonic()
         self._missing_tool_recoveries = 0
         classification = classify_turn(
             text,
@@ -2527,6 +2676,29 @@ Rules:
         )
         if self.task is not None:
             set_task_id(self.task.task_id)
+
+        if getattr(self, "_awaiting_chat_spelling", None) is not None:
+            response = self._resolve_chat_spelling(text)
+            if response is not None:
+                self._record("user", text)
+                self._record("assistant", response.text)
+                return response
+
+        failed_send = getattr(self, "_last_failed_send", None)
+        if failed_send is not None and self.pending_confirmation is None:
+            self._last_failed_send = None
+            if re.fullmatch(r"(?:please\s+)?(?:try(?: it)? again|retry|again|do it again|send it again|one more time)[.!]*",
+                            text.strip(), re.I):
+                # Retry exactly what was confirmed, corrections included; the AI's copy
+                # still had the first-heard name ("Siu") in the live log.
+                retry = ToolCall(call_id=f"{failed_send.call_id}-retry", name=failed_send.name, arguments=dict(failed_send.arguments))
+                self._ensure_active_task()
+                self.pending_confirmation = retry
+                self.task.status = TaskStatus.AWAITING_CONFIRMATION
+                self._record("user", text)
+                reply = f"Before I try again, I need your confirmation: {self._confirmation_description(retry).rstrip('.')}. Say yes to continue or no to cancel."
+                self._record("assistant", reply)
+                return AdviResponse(reply)
 
         if self.pending_confirmation is not None:
             self._record("user", text)
@@ -2601,13 +2773,23 @@ Rules:
             self._record("user", text)
             return AdviResponse("Nothing is running right now, so there's nothing to cancel.")
 
-        diagnosis = self._handle_local_diagnosis(text)
+        # Time and date come from this PC's clock, not the AI: given the local time in its
+        # context it still answered "I'm not able to retrieve the current time" (sweep, 2026-10-25).
+        clock = match_local_intent(text)
+        if clock is not None and clock.kind == "answer" and clock.detail.get("what") in {"time", "date"}:
+            answer = self._handle_local_intent(text)
+            if answer is not None:
+                self._record("user", text)
+                self._record("assistant", answer.text)
+                return answer
+        diagnosis = self._handle_local_diagnosis(text) or self._handle_slowness_question(text)
         if diagnosis is not None:
             self._record("user", text)
             self._record("assistant", diagnosis.text)
             return diagnosis
 
         self._persist_explicit_contact_facts(text)
+        self._persist_user_profile_facts(text)
         retrying_task = bool(
             self.task is not None
             and self.task.status in {TaskStatus.FAILED, TaskStatus.UNCERTAIN}
@@ -2744,6 +2926,22 @@ Rules:
         handoff = self._handoff()
         # The model has no clock; without this, "what is today's date?" is a guess.
         now_line = time.strftime("[LOCAL TIME] %A %d %B %Y, %H:%M")
+        # Who the user is, so "what do you know about me" isn't answered from file history.
+        profile_line = self._user_profile_line()
+        if profile_line:
+            now_line = f"{now_line}\n{profile_line}"
+        # When voice runs on the slower offline model, the AI knows why too.
+        status = getattr(self, "speech_status", None)
+        voice_line = status() if callable(status) else None
+        if voice_line:
+            now_line = f"{now_line}\n[VOICE] {voice_line}"
+        reply_note = getattr(self, "_confirmation_reply_note", None)
+        if reply_note:
+            self._confirmation_reply_note = None
+            now_line = f"{now_line}\n{reply_note}"
+        previous = self._previous_answer_for(text)
+        if previous:
+            now_line = f"{now_line}\n[YOUR PREVIOUS ANSWER, IN FULL]\n{previous}\n[END OF PREVIOUS ANSWER]"
         context_text = f"{now_line}\n\n{context_text}" if context_text else now_line
         user_payload = text
         if context_text:
@@ -2818,7 +3016,7 @@ Rules:
                             return AdviResponse(answer)
                         self.task.status = TaskStatus.FAILED
                         self.task.context["terminal_reason"] = "empty_model_response"
-                    return AdviResponse("I couldn't produce a usable response.")
+                    return AdviResponse("Sorry, I didn't get an answer from the AI for that. Please say the whole request again in one sentence, for example: send hello from advi to David on WhatsApp.")
                 if self.task is not None and self.task.status not in {TaskStatus.AWAITING_INPUT, TaskStatus.AWAITING_CONFIRMATION}:
                     self._finalize_task_status()
                 authoritative_task = self._authoritative_task_response()
@@ -2827,18 +3025,32 @@ Rules:
                 authoritative = self._authoritative_completion_response()
                 if authoritative:
                     answer = authoritative
+                answer = self._no_unbacked_send_claim(answer)
+                answer = self._no_unbacked_memory_claim(answer)
+                if self.pending_confirmation is not None and getattr(self, "_answered_pending_reply", False):
+                    # The AI replied about a pending action without changing it. Say plainly
+                    # what "yes" does now: in the live log the AI asked "change it to ADVI?
+                    # say yes to send it", and "yes" sent the uncorrected email.
+                    self._answered_pending_reply = False
+                    description = self._confirmation_description(self.pending_confirmation).rstrip(".")
+                    answer = f"{answer.rstrip()} Right now, yes will {description}, unchanged. Say yes, no, or tell me what to change."
                 self.last_assistant_message = answer
                 self._record("assistant", answer)
                 return AdviResponse(answer)
 
             self._ensure_active_task()
             assert self.task is not None
+            if getattr(self, "_stop_requested", False):
+                self.task.status = TaskStatus.CANCELLED
+                self.task.waiting_for = None
+                return AdviResponse("Okay, I stopped.")
             if not self.task.consume_tool_round(self.max_tool_rounds):
                 self.task.context["terminal_reason"] = "maximum_tool_rounds_reached"
                 self.task.status = TaskStatus.FAILED
                 return AdviResponse("I stopped because the task exceeded ADVI's safe tool-call limit without reaching a final answer.")
 
-            calls = [ToolCall(call_id=c.call_id, name=c.name, arguments=dict(c.arguments)) for c in response.tool_calls]
+            calls = [self._restore_spoken_chat(ToolCall(call_id=c.call_id, name=c.name, arguments=dict(c.arguments)))
+                     for c in response.tool_calls]
             trace(
                 "gateway.agent_session.tool_calls",
                 source_component="AgentSession",
@@ -2847,6 +3059,7 @@ Rules:
             )
             confirmation_call = next((c for c in calls if self._requires_confirmation(c)), None)
             if confirmation_call is not None:
+                confirmation_call = self._resolve_spoken_chat(confirmation_call)
                 self.pending_confirmation = confirmation_call
                 self.task.status = TaskStatus.AWAITING_CONFIRMATION
                 description = self._confirmation_description(confirmation_call)
@@ -3048,12 +3261,23 @@ Rules:
                 # precomputed chain of side effects from one model response. One
                 # state-changing action is enough; checkpoint the environment and
                 # give the LLM a fresh world before it chooses the next action.
+                # Creating several different folders or files ("create 2024, 2025 and
+                # Archive") are independent steps, not a dependent chain. Pausing after
+                # the first made the model lose track and create all three again until
+                # the tool-call limit (capability sweep, 2026-10-25).
+                independent_batch = (
+                    call.name in _INDEPENDENT_BATCH_TOOLS
+                    and index < len(calls) - 1
+                    and all(c.name == call.name for c in calls[index + 1:])
+                    and len({json.dumps(dict(c.arguments), sort_keys=True) for c in calls}) == len(calls)
+                )
                 if (
                     strategy.mode is not ExecutionMode.SIMPLE
                     and is_state_changing_tool(call.name)
                     and result.success
                     and strategy.max_side_effects_per_round <= 1
                     and index < len(calls) - 1
+                    and not independent_batch
                 ):
                     self._adaptive_checkpoint_after_tool(call, result)
                     trace(
@@ -3222,6 +3446,137 @@ Rules:
               tool=call.name, before=call.arguments, after=arguments)
         return ToolCall(call_id=call.call_id, name=call.name, arguments=arguments)
 
+    _SPOKEN_NAME_RE = re.compile(
+        r"\b(?:named|called|titled)\s+[\"'“]?(?P<name>[A-Za-z0-9][\w\-]*(?:\s+[\w\-]+){0,3}?)[\"'”]?"
+        r"(?=\s+(?:in|on|to|at|inside|under|with|and|that|which|about)\b|\s*[.,;!?]|\s*$)",
+        re.I,
+    )
+
+    def _restore_spoken_file_name(self, call: ToolCall) -> ToolCall:
+        """Keep the file name the user said ("a PDF named Water").
+
+        Desktop Suite dev run (2026-10-23): "save it as a PDF named Water in
+        Documents\\ADVI Bench\\advi-word-pdf" became "Drinking Water.pdf",
+        named after the heading the model wrote.
+        """
+        if call.name not in {"word_create_document", "create_file", "save_file"}:
+            return call
+        said = str(self.last_user_message or (self.task.goal if self.task else "") or "")
+        match = self._SPOKEN_NAME_RE.search(said)
+        if not match:
+            return call
+        name = match.group("name").strip()
+        path = str(call.arguments.get("path") or "")
+        if name.casefold() in path.casefold():
+            return call
+        arguments = dict(call.arguments)
+        if call.name == "word_create_document":
+            arguments["name"] = name
+        else:
+            last = re.split(r"[\\/]", path)[-1] if path else ""
+            if "." not in last:
+                return call  # a folder or no path: nothing safe to rename
+            stem, extension = last.rsplit(".", 1)
+            arguments["path"] = path[: len(path) - len(last)] + f"{name}.{extension}"
+        trace("gateway.agent_session.spoken_file_name_restored", source_component="AgentSession",
+              tool=call.name, before=call.arguments, after=arguments)
+        return ToolCall(call_id=call.call_id, name=call.name, arguments=arguments)
+
+    _SENT_CLAIM_RE = re.compile(
+        r"\b(?:i(?:'ve| have)? (?:just |already )?sent|(?:has|have) been sent|was sent|message sent|email sent|"
+        r"successfully sent|i(?:'ve| have)? delivered)\b",
+        re.I,
+    )
+
+    _MEMORY_CLAIM_RE = re.compile(
+        # Only claims about *memory*: "I've saved it to example_count.txt" is a
+        # file save and was wrongly replaced (Desktop Suite dev run, 2026-10-23).
+        r"\b(?:i(?:'ll| will)\s+(?:remember|keep that in mind)|i(?:'ve| have)\s+remembered|"
+        r"(?:saved|stored|noted)\s+(?:that|this|it)?\s*(?:to|in)\s+(?:my\s+)?memory)\b",
+        re.I,
+    )
+
+    def _no_unbacked_memory_claim(self, answer: str) -> str:
+        """Never say something was remembered unless a memory write happened this turn."""
+        if not self._MEMORY_CLAIM_RE.search(str(answer or "").replace("\u2019", "'")):
+            return answer
+        started = getattr(self, "_turn_started_at", None)
+        wrote_at = getattr(self, "_last_memory_write_at", None)
+        if started is not None and wrote_at is not None and wrote_at >= started:
+            return answer
+        trace("gateway.agent_session.unbacked_memory_claim", source_component="AgentSession", answer=answer)
+        return ("I haven't saved that to memory yet. Say \"remember that\" followed by what you'd like me to keep, "
+                "and I'll store it.")
+
+    def _no_unbacked_send_claim(self, answer: str) -> str:
+        """Never say a message or email was sent unless a send succeeded this turn.
+
+        Live log, 2026-10-21: "okay send message to david" got "I've sent the
+        WhatsApp message to David" with no tool call at all.
+        """
+        if not self._SENT_CLAIM_RE.search(str(answer or "").replace("\u2019", "'")):
+            return answer
+        # Describing mail that *others* sent ("the latest email was sent by your bank")
+        # is not a claim that ADVI sent something; it replaced a correct inbox answer
+        # (capability sweep, 2026-10-25).
+        if self.task is not None and any(str(o.get("tool")) == "email_read" and o.get("success")
+                                         for o in self.task.tool_outcomes) and not self._is_send_request(str(self.last_user_message or "")):
+            return answer
+        started = getattr(self, "_turn_started_at", None)
+        sent_at = getattr(self, "_last_send_at", None)
+        if started is not None and sent_at is not None and sent_at >= started:
+            return answer
+        trace("gateway.agent_session.unbacked_send_claim", source_component="AgentSession", answer=answer)
+        return ("I haven't sent anything yet. Tell me who to send it to, which app, and the message, "
+                "for example: send hello to David on WhatsApp. I'll ask you to confirm before it goes.")
+
+    @staticmethod
+    def _is_send_request(text: str) -> bool:
+        return bool(re.search(r"\b(?:send|reply|forward|message|text|mail|email)\b.{0,40}\b(?:to|saying|that)\b", text, re.I)) \
+            and not re.search(r"\b(?:who|which|what)\b.{0,20}\b(?:sent|send)\b", text, re.I)
+
+    def _restore_spoken_chat(self, call: ToolCall) -> ToolCall:
+        """Keep the chat name the user said.
+
+        Live log, 2026-10-21: "send message to David saying Hello from advi on
+        whatsapp" became chat "David Almeida" (from the email contact list), a
+        chat that does not exist in WhatsApp.
+        """
+        if call.name not in _CHAT_TOOLS:
+            return call
+        chat = str(call.arguments.get("chat") or "").strip()
+        # A name the user corrected or spelled, or a known chat ADVI matched to what it
+        # heard, replaces the spoken one on purpose; restoring "CU" would undo it.
+        if chat.casefold() in getattr(self, "_chat_heard_as", {}):
+            return call
+        said_parts = [str(self.last_user_message or "")]
+        if self.task is not None and self.task.goal:
+            said_parts.append(str(self.task.goal))
+        said = " ".join(said_parts)
+        norm = lambda value: re.sub(r"\s+", " ", re.sub(r"[^\w\s+]", " ", value.casefold())).strip()
+        said_norm = f" {norm(said)} "
+        if not chat or f" {norm(chat)} " in said_norm:
+            return call
+        restored = None
+        for text in said_parts:
+            parsed = match_local_intent(text)
+            if parsed is not None and parsed.tool in _CHAT_TOOLS and parsed.arguments.get("chat"):
+                restored = str(parsed.arguments["chat"])
+                break
+        if restored is None:
+            words = chat.split()
+            for size in range(len(words) - 1, 0, -1):
+                prefix = " ".join(words[:size])
+                if f" {norm(prefix)} " in said_norm:
+                    restored = prefix
+                    break
+        if not restored:
+            return call
+        trace("gateway.agent_session.spoken_chat_restored", source_component="AgentSession", tool=call.name, before=chat, after=restored)
+        arguments = dict(call.arguments)
+        arguments["chat"] = restored
+        return ToolCall(call_id=call.call_id, name=call.name, arguments=arguments)
+
     def _too_short_for_request(self, call: ToolCall) -> ToolResult | None:
         """Refuse a document whose content is a stub of what the user asked to be written.
 
@@ -3245,7 +3600,7 @@ Rules:
         return None
 
     # --- deterministic commands (no language-model request) -------------------
-    def _handle_local_intent(self, text: str) -> AdviResponse | None:
+    def _handle_local_intent(self, text: str, *, offline: bool = False) -> AdviResponse | None:
         """Run a clear, common command without spending AI quota.
 
         Sends are never executed here: they stop at the same confirmation step
@@ -3253,7 +3608,12 @@ Rules:
         """
         if not getattr(self, "local_intents_enabled", True):
             return None
-        intent = match_local_intent(text)
+        intent = match_local_intent(text, offline=offline)
+        if intent is not None and intent.kind == "answer" and intent.detail.get("what") in {"time", "date"}:
+            self.last_user_message = text
+            if intent.detail["what"] == "time":
+                return AdviResponse(time.strftime("It's %I:%M %p.").replace(" 0", " ", 1))
+            return AdviResponse(time.strftime("Today is %A, %d %B %Y."))
         if intent is None or self.tools.get(intent.tool) is None:
             return None
         if intent.kind == "email" and self.tools.get("contact_lookup") is None and "@" not in intent.arguments["to"]:
@@ -3266,6 +3626,7 @@ Rules:
             return self._local_email(intent)
         if intent.kind in {"whatsapp", "telegram"}:
             call = ToolCall(call_id=f"local-{uuid.uuid4().hex[:10]}", name=intent.tool, arguments=dict(intent.arguments))
+            call = self._resolve_spoken_chat(call)
             self.pending_confirmation = call
             self.task.status = TaskStatus.AWAITING_CONFIRMATION
             return AdviResponse(
@@ -3336,14 +3697,16 @@ Rules:
         """
         if self._local_commands_mode() != "fallback" or retrying_task:
             return None
-        if self.task is not None and self.task.tool_outcomes:
+        # Only what ran in *this* turn matters: an older task that kept its progress
+        # must not block a new simple command (live log 2026-10-24).
+        if getattr(self, "_turn_tools_run", 0):
             return None
-        if match_local_intent(text) is None:
+        if match_local_intent(text, offline=True) is None:
             return None
         self._describe_provider_failure(exc)  # keeps "what was the problem?" answerable
         if self.task is not None:
             self.task.status = TaskStatus.IN_PROGRESS
-        handled = self._handle_local_intent(text)
+        handled = self._handle_local_intent(text, offline=True)
         if handled is None:
             return None
         trace("gateway.agent_session.local_fallback", source_component="AgentSession", error_type=type(exc).__name__)
@@ -3394,6 +3757,12 @@ Rules:
             f"Before I do that, I need your confirmation: send an email to {recipient} saying '{body[:120]}'"
             f"{f' with subject {subject!r}' if subject else ''}. Say yes to continue or no to cancel."
         )
+
+    def _announce_short_wait(self, seconds: float) -> None:
+        """Say why there is a pause instead of leaving a blind user in silence."""
+        callback = getattr(self, "progress_callback", None)
+        if callback is not None:
+            callback(f"The AI is busy for a moment, so I'm waiting about {int(round(seconds))} seconds.")
 
     def _narrate_tool(self, call: ToolCall) -> None:
         callback = getattr(self, "progress_callback", None)
@@ -3469,6 +3838,7 @@ Rules:
             "rename_file", "copy_folder", "move_folder", "rename_folder",
             "open_application", "close_application", "close_window", "focus_window",
             "email_draft_create", "email_draft_update", "email_send", "email_reply",
+            "email_forward", "email_trash", "email_archive", "email_mark",
             "search_file_content",
         }
         if self.last_tool in terminal_tools:
@@ -3499,7 +3869,16 @@ Rules:
         if self.task is None:
             return None
         if self.task.status == TaskStatus.FAILED:
-            detail = self.last_tool_summary or self.task.context.get("terminal_reason") or "the requested operation could not be completed"
+            if self._only_browsing_ending_well():
+                # A missed search box or a stale ref while only reading a site
+                # changed nothing; the answer found afterwards is the result.
+                return None
+            # Say what failed, not what was looked at last: a screen description ("The
+            # application is Media Player, displaying a video...") was reported as the
+            # failure (capability sweep, 2026-10-25).
+            failed = next((o for o in reversed(self.task.tool_outcomes) if not o.get("success")), None)
+            detail = ((failed or {}).get("summary") or self.last_tool_summary
+                      or self.task.context.get("terminal_reason") or "the requested operation could not be completed")
             return f"I couldn't complete that: {detail}"
         if self.task.status == TaskStatus.UNCERTAIN:
             if not self.task.tool_outcomes:
@@ -3511,16 +3890,45 @@ Rules:
                 # the model to misreport; its answer *is* the result. Overriding it
                 # hid "the PDF only contains placeholder text" in the runtime log.
                 return None
+            outcomes = list(self.task.tool_outcomes)
+            last = outcomes[-1] if outcomes else {}
+            if (self.task.context.get("verified_progress_preserved") and last.get("success")
+                    and last.get("verified") and self.last_tool_summary):
+                # The step was verified; only the AI's closing sentence was lost (a
+                # per-minute limit after "pause" in the live log). Say what happened.
+                if self._has_verified_terminal_evidence():
+                    return self.last_tool_summary
+                return f"{self.last_tool_summary.rstrip('.')}. The AI stopped answering before the rest; say try again to continue."
             detail = self.last_tool_summary or "the final state could not be verified"
             return f"I completed the attempted action, but I couldn't verify the final state: {detail}"
         return None
 
-    def _only_verified_observations(self) -> bool:
+    def _only_browsing_ending_well(self) -> bool:
         outcomes = list(self.task.tool_outcomes) if self.task is not None else []
-        return bool(outcomes) and all(
-            is_observation_tool(str(item.get("tool") or item.get("name") or ""))
-            and item.get("success")
-            and item.get("verified")
+        names = [str(item.get("tool") or item.get("name") or "") for item in outcomes]
+        return bool(outcomes) and outcomes[-1].get("success") and all(
+            is_observation_tool(name) or name in _BROWSING_TOOLS for name in names)
+
+    def _only_verified_observations(self) -> bool:
+        # A read-only look (listing files, reading a page) changes nothing, so
+        # there is no side effect to misreport even when it isn't "verified".
+        # Requiring verification replaced "here are your 20 videos: ..." with
+        # "I couldn't verify the final state: Found 20 files" (log, 2026-10-23).
+        # Browsing is the same: searching, navigating and clicking ordinary links
+        # change nothing (purchase/send/delete clicks are gated separately). On
+        # WebVoyager "find a floral queen bedspread on Amazon in blue" the answer
+        # was replaced by "couldn't verify the final state: Extracted 3060
+        # characters" (dev run, 2026-10-23).
+        # A failed or rejected look along the way changed nothing either, so only the
+        # last step must have worked: "status of laptop" (get_system_info rejected for
+        # an unknown parameter, then answered) and "is internet connected?" (a search
+        # with no results, then a test page that opened) were both answered "couldn't
+        # verify the final state" (live log 2026-10-25).
+        outcomes = list(self.task.tool_outcomes) if self.task is not None else []
+        return bool(outcomes) and bool(outcomes[-1].get("success")) and all(
+            is_observation_tool(name := str(item.get("tool") or item.get("name") or ""))
+            or name in _BROWSING_TOOLS or name in _READ_ONLY_TOOLS
+            or (name == "type_web_element" and _SEARCH_RESULTS_URL.search(str(item.get("summary") or "")))
             for item in outcomes
         )
 
@@ -4170,6 +4578,10 @@ Rules:
             } or str(observed.output or "")[:5000]
         if observed.metadata.get("screenshot_path"):
             payload["screenshot_path"] = observed.metadata.get("screenshot_path")
+        trigger = self._vision_trigger(call, result, observed, None)
+        visual = self._look_at_screen_for(call, trigger) if trigger else None
+        if visual:
+            payload["visual"] = visual
 
         self.task.set_context("adaptive_observation", json.dumps(payload, ensure_ascii=False, default=str, separators=(",", ":"))[:8000])
         self.task.set_context("adaptive_observation_age", "fresh")
@@ -4189,7 +4601,79 @@ Rules:
             perception_reason=decision.reason,
         )
 
+    _SEARCH_FILLER = frozenset({"site", "www", "com", "org", "net", "in", "co", "uk", "http", "https", "on", "the"})
+
+    def _search_key(self, query: str) -> str:
+        """The same search, however it's reworded with the site's name or "site:"."""
+        goal = str(self.task.goal if self.task is not None else "")
+        site_words = {w for url in re.findall(r"https?://([^/\s]+)", goal) for w in re.findall(r"[a-z0-9]+", url.casefold())}
+        words = {w for w in re.findall(r"[a-z0-9]+", str(query).casefold())}
+        return " ".join(sorted(words - self._SEARCH_FILLER - site_words))
+
+    def _repeated_search(self, call: LLMToolCall) -> ToolResult | None:
+        """Don't run a search this task already ran; point at its results instead.
+
+        WebVoyager dev run (2026-10-23): "gluten free brownies" was searched six
+        times as "... site:allrecipes.com", "... allrecipes" and "allrecipes.com
+        ...", until ADVI's step limit ended the task with no answer.
+        """
+        if call.name != "search" or self.task is None:
+            return None
+        key = self._search_key(str(call.arguments.get("query") or ""))
+        earlier = (self.task.context.get("searches") or {}).get(key) if key else None
+        if earlier is None:
+            return None
+        note = (f"Already searched for this; the results page is open ({earlier}). Don't search again: "
+                "read it with read_web_page (start= for more), click a result, or answer from what you have.")
+        trace("gateway.agent_session.repeated_search_skipped", source_component="AgentSession", query=call.arguments.get("query"))
+        return ToolResult(call_id=call.call_id, name=call.name, success=True, output={"result": note},
+                          human_readable=note, verified=True, verification_status="verified",
+                          verification_details={"method": "repeated_search_skipped"})
+
     def _run_tool(self, call: LLMToolCall, *, approved: bool = False) -> ToolResult:
+        repeated = self._repeated_search(call)
+        if repeated is not None:
+            return repeated
+        wrong_close = self._close_target_refusal(call)
+        if wrong_close is not None:
+            return wrong_close
+        if getattr(self, "_stop_requested", False):
+            # The user said "stop" by voice while this task was running.
+            return ToolResult(call_id=call.call_id, name=call.name, success=False,
+                              error="Stopped because you asked me to.", verified=True, verification_status="failed")
+        self._turn_tools_run = getattr(self, "_turn_tools_run", 0) + 1
+        result = self._run_tool_impl(call, approved=approved)
+        if call.name == "search" and result.success and self.task is not None:
+            key = self._search_key(str(call.arguments.get("query") or ""))
+            if key:
+                searches = dict(self.task.context.get("searches") or {})
+                searches[key] = str((result.metadata or {}).get("current_url") or result.human_readable or "")[:200]
+                self.task.set_context("searches", searches)
+        if result.success and getattr(result, "name", None) in {"memory_update", "memory_remember"}:
+            self._last_memory_write_at = time.monotonic()
+        if call.name in _CHAT_APPS:
+            self._learn_chat(call, result)
+        if result.success and call.name in _BROWSING_TOOLS | {"type_web_element", "read_web_page", "inspect_web_page"}:
+            # Where the browser is now, so a search for the open site stays on it.
+            self._browser_url = str((result.metadata or {}).get("current_url")
+                                    or call.arguments.get("url") or getattr(self, "_browser_url", "") or "")
+        if (call.name == "open_application" and result.success
+                and "notepad" in str(call.arguments.get("application") or "").casefold()
+                and re.search(r"\b(?:type|write|enter|draft|note)\b", str(self.last_user_message or ""), re.I)):
+            self._fresh_notepad_tab(result)
+        if call.name == "email_read" and result.success and isinstance(result.output, list):
+            index = getattr(self, "_email_index", {})
+            for item in result.output:
+                if isinstance(item, dict) and item.get("id"):
+                    index[str(item["id"])] = {"from": str(item.get("from") or ""), "subject": str(item.get("subject") or "")}
+            self._email_index = index
+        if result.success and getattr(result, "name", None) in _SEND_TOOLS:
+            # A David run that only prepared a draft is not a send.
+            if result.name != "david_fallback" or not (result.metadata or {}).get("awaiting_send_confirmation"):
+                self._last_send_at = time.monotonic()
+        return result
+
+    def _run_tool_impl(self, call: LLMToolCall, *, approved: bool = False) -> ToolResult:
         record_metric("tool_calls")
         if is_observation_tool(call.name):
             record_metric("observation_calls")
@@ -4198,6 +4682,8 @@ Rules:
         assert self.task is not None
         self.task.status = TaskStatus.IN_PROGRESS
         call = self._normalize_native_call(call)
+        call = self._search_on_the_named_site(call)
+        call = self._keep_browsing_in_the_browser(call)
         call = self._normalize_list_files_call(call)
         call = self._enrich_structured_document_call(call)
         normalized_call, _contract_errors = validate_and_normalize_tool_call(call)
@@ -4205,6 +4691,8 @@ Rules:
             call = normalized_call
         call = self._apply_protected_task_parameters(call)
         call = self._restore_spoken_path_words(call)
+        call = self._restore_spoken_file_name(call)
+        call = self._restore_spoken_chat(call)
         too_short = self._too_short_for_request(call)
         if too_short is not None:
             return too_short
@@ -4302,6 +4790,12 @@ Rules:
                 verification_status=result.verification_status,
                 summary=self.last_tool_summary,
             )
+            if not result.success and str(result.error or "").startswith("Tool call rejected:") \
+                    and "confirmation" not in str(result.error):
+                # Rejected before it ran (a wrong parameter): nothing happened, so it is not
+                # a failure of the task. Amazon's answer became "Tool call rejected: Unknown
+                # parameter 'application'" after the model retried correctly (sweep, 2026-10-25).
+                self.task.mark_recovered(call.name)
 
             # A verified inspection can resolve an earlier launch uncertainty.
             # This matters for Windows Store/shell-launched applications where the
@@ -4423,7 +4917,7 @@ Rules:
         self.task.set_context("last_tool_verification", dict(result.verification_details or {}))
         if result.success:
             self.task.set_context("last_verified", result.verified)
-            if result.verified and call.name not in {"read_screen", "inspect_web_page"}:
+            if result.verified and call.name not in {"read_screen", "inspect_web_page", "look_at_screen"}:
                 for key in ("native_recovery_domain", "native_recovery_observed", "native_recovery_observation", "native_recovery_observation_error"):
                     self.task.context.pop(key, None)
         else:
@@ -4475,6 +4969,10 @@ Rules:
         self.task.set_context("native_recovery_call_id", origin.call_id)
         if not observed.success:
             self.task.set_context("native_recovery_observation_error", observed.error or "observation failed")
+            visual = self._look_at_screen_for(origin, "structure_blind")
+            if visual:
+                result.metadata["recovery_observation"] = {"kind": "visual_observation", "visual": visual}
+                self.task.set_context("native_recovery_observation", json.dumps(visual, ensure_ascii=False, default=str)[:4000])
             return
 
         state = self.task.context.get("progress")
@@ -4483,7 +4981,7 @@ Rules:
             self.task.context["progress"] = state
         # Count internal observations too, so stalls are judged on every look at
         # the screen, not only the ones the model asked for.
-        progress.record_observation(state, observation_call.name, observed.output)
+        verdict = progress.record_observation(state, observation_call.name, observed.output)
 
         if domain == "browser":
             payload = {
@@ -4504,6 +5002,10 @@ Rules:
                 "text": str(observed.output or "")[:6000],
                 "screenshot_path": observed.metadata.get("screenshot_path"),
             }
+        trigger = self._vision_trigger(origin, result, observed, verdict)
+        visual = self._look_at_screen_for(origin, trigger) if trigger else None
+        if visual:
+            payload["visual"] = visual
         compact = json.dumps(payload, ensure_ascii=False, default=str, separators=(",", ":"))[:8000]
         result.metadata["recovery_observation"] = payload
         self.task.set_context("native_recovery_observation", compact)
@@ -4516,15 +5018,218 @@ Rules:
             observation_chars=len(compact),
         )
 
+    def _vision_trigger(
+        self,
+        origin: ToolCall,
+        result: ToolResult,
+        observed: ToolResult,
+        verdict: dict[str, Any] | None,
+    ) -> str | None:
+        """Why structure is not enough after this action, or None.
+
+        Vision is the last rung: only when the structured observer saw nothing,
+        the screen did not change after an action, or a consequential action
+        ended without verification.
+        """
+        # Sound can't be seen: a look after volume or play/pause keys only spent
+        # quota (log, 2026-10-23).
+        if origin.name in _NO_VISION_TOOLS:
+            return None
+        if not observed.success or self._observation_is_blind(observed.output):
+            return "structure_blind"
+        if verdict is not None and not verdict.get("screen_changed", True):
+            return "stalled"
+        spec = self.tools.get(origin.name) if self.tools is not None else None
+        if result.success and not result.verified and getattr(spec, "side_effect", "low") == "critical":
+            return "uncertain_final_state"
+        return None
+
+    @staticmethod
+    def _observation_is_blind(output: Any) -> bool:
+        if output in (None, "", [], {}):
+            return True
+        if isinstance(output, str):
+            return not output.strip()
+        if isinstance(output, list):
+            return len(output) == 0
+        if isinstance(output, dict) and isinstance(output.get("elements"), list):
+            return len(output["elements"]) <= _BLIND_ELEMENT_COUNT
+        return False
+
+    def _look_at_screen_for(self, origin: ToolCall, trigger: str) -> dict[str, Any] | None:
+        """One bounded look with the vision model at the window ADVI is working in."""
+        if self.task is None or self.tools is None or self.tools.get("look_at_screen") is None:
+            return None
+        used = int(self.task.context.get("vision_calls") or 0)
+        if used >= _VISION_BUDGET:
+            return None
+        action = origin.name.replace("_", " ")
+        target = str(origin.arguments.get("target") or origin.arguments.get("element_id") or origin.arguments.get("url") or "")[:80]
+        step = f"{action} {target!r}" if target else action
+        question = {
+            "structure_blind": f"The last step was {step}. What app or page is showing, what is its main content, and is anything blocking it?",
+            "stalled": f"The last step was {step} and the screen did not seem to change. What is on screen now, and is anything blocking or still loading?",
+            "uncertain_final_state": f"The last step was {step}. What does the screen say now: is there a confirmation, an error, or a page asking for more input?",
+        }.get(trigger, f"The last step was {step}. What is on screen now?")
+        self.task.set_context("vision_calls", used + 1)
+        try:
+            observed = self.tool_runner.run(
+                ToolCall(call_id=f"vision-{uuid.uuid4().hex[:12]}", name="look_at_screen",
+                         arguments={"question": question, "foreground": True}),
+                approved=False,
+            )
+        except Exception as exc:
+            logger.warning("Automatic look at the screen failed: %s", exc)
+            return None
+        # The OCR fallback adds nothing the structured observer has not shown.
+        if not observed.success or (observed.metadata or {}).get("vision_error"):
+            return None
+        trace(
+            "gateway.agent_session.vision_escalation",
+            source_component="AgentSession",
+            origin_tool=origin.name,
+            trigger=trigger,
+            cached=bool((observed.metadata or {}).get("cached")),
+        )
+        return {
+            "source": "look_at_screen",
+            "trigger": trigger,
+            "question": question,
+            "answer": str(observed.output or "")[:1500],
+            "note": "What the screen shows (visual evidence). Act through element IDs or refs, not positions; this is not proof the task succeeded.",
+        }
+
     def _normalize_native_call(self, call: LLMToolCall) -> LLMToolCall:
         """Normalize model/provider-era tool aliases before contract validation."""
         try:
             runtime_name = self.tools.runtime_name(call.name)
         except Exception:
             runtime_name = None
+        call = self._remap_other_user_paths(call)
         if not runtime_name or runtime_name == call.name:
             return self._redirect_browser_launch(call)
         return self._redirect_browser_launch(LLMToolCall(call_id=call.call_id, name=runtime_name, arguments=dict(call.arguments)))
+
+    _CLOSE_KINDS = {
+        r"\b(?:video|music|media|audio|movie)\s*player\b|\bplayer\b": (
+            "media player", "movies & tv", "films & tv", "vlc", "groove", "windows media player", "mpc", "potplayer", "mpv"),
+        r"\bbrowser\b": ("chrome", "edge", "brave", "firefox", "opera"),
+        r"\b(?:music app)\b": ("spotify", "youtube music", "media player", "groove"),
+    }
+
+    def _close_target_refusal(self, call: ToolCall) -> ToolResult | None:
+        """Only close what the user asked to close.
+
+        Capability sweep (2026-10-25): "close the video player" (the clip had already
+        ended) made the model try four times to close the user's Brave window with an
+        unrelated Gemini chat. Closing another app can lose the user's work; the target
+        must match the app named, or the kind of app asked for.
+        """
+        if call.name not in {"close_application", "close_window"}:
+            return None
+        request = str(self.last_user_message or "").casefold()
+        if not re.search(r"\b(?:close|quit|exit|shut|kill)\b", request):
+            return None  # not a closing request (e.g. an app closed as part of a larger task)
+        target = str(call.arguments.get("application") or call.arguments.get("title") or "").strip()
+        if call.name == "close_window" and not target:
+            target = self._foreground_title()
+        name = target.casefold()
+        if not name:
+            return None
+        if any(word in request for word in re.findall(r"[a-z0-9]{3,}", name) if word not in {"the", "window", "app", "microsoft", "google"}):
+            return None  # the app's name was said
+        for pattern, kinds in self._CLOSE_KINDS.items():
+            if re.search(pattern, request) and any(kind in name for kind in kinds):
+                return None  # the kind of app was said ("video player" -> Media Player)
+        trace("gateway.agent_session.close_target_refused", source_component="AgentSession", target=target, request=request)
+        return ToolResult(
+            call_id=call.call_id, name=call.name, success=False, verified=True, verification_status="failed",
+            error=(f"Not closed: '{target}' is not what the user asked to close. If the app they asked for isn't "
+                   "open, tell them so instead of closing something else."),
+        )
+
+    _BROWSER_TITLE = re.compile(r"\b(?:chrome|chromium|edge|brave|firefox)\b|\s-\s(?:google chrome|microsoft edge)$", re.I)
+
+    def _keep_browsing_in_the_browser(self, call: LLMToolCall) -> LLMToolCall:
+        """Desktop scroll / observe during web browsing act on the page, not the front window.
+
+        On Amazon the model scrolled and "observed" the window in front, which was the
+        Claude app, not ADVI's browser (capability sweep, 2026-10-25).
+        """
+        if call.name not in {"scroll", "observe_window"} or not getattr(self, "_browser_url", ""):
+            return call
+        if self.last_tool not in _BROWSING_TOOLS | {"type_web_element", "read_web_page", "inspect_web_page"}:
+            return call
+        if call.arguments.get("application") and not self._BROWSER_TITLE.search(str(call.arguments.get("application"))) \
+                and str(call.arguments.get("application")).casefold() != "browser":
+            return call  # aimed at a named desktop app on purpose
+        if self._BROWSER_TITLE.search(self._foreground_title()):
+            return call  # the browser is in front: desktop tools reach it
+        name = "inspect_web_page" if call.name == "observe_window" else "read_web_page"
+        if self.tools.get(name) is None:
+            return call
+        trace("gateway.agent_session.browsing_kept_in_browser", source_component="AgentSession", from_tool=call.name, to_tool=name)
+        return LLMToolCall(call_id=call.call_id, name=name, arguments={})
+
+    def _search_on_the_named_site(self, call: LLMToolCall) -> LLMToolCall:
+        """'Search Amazon for X' searches Amazon, not Google with site:amazon.com.
+
+        Capability sweep (2026-10-25): the model searched Google for "wireless mouse
+        site:amazon.com", and "Search Google for X" first searched the YouTube page that
+        happened to be open. Using the wrong website fails the task (WebVoyager rule).
+        The same deterministic site-search rule ADVI uses offline picks the site's own
+        search page.
+        """
+        if call.name != "search":
+            return call
+        request = str(self.last_user_message or "")
+        intent = match_local_intent(request)
+        if intent is None or intent.kind != "site_search" or not intent.arguments.get("url"):
+            return call
+        if not re.search(rf"\b{re.escape(str(intent.detail.get('site') or ''))}\b", request, re.I):
+            return call  # "search for headphones" on an open site keeps searching that site
+        import urllib.parse as _urlparse
+
+        target_host = _urlparse.urlparse(intent.arguments["url"]).netloc.removeprefix("www.")
+        current = str(getattr(self, "_browser_url", "") or "")
+        if target_host and target_host.split(".")[0] in _urlparse.urlparse(current).netloc:
+            return call  # already on that site (e.g. right after navigating there): search it there
+        if self.tools.get("navigate") is None:
+            return call
+        trace("gateway.agent_session.search_routed_to_site", source_component="AgentSession",
+              site=intent.detail.get("site"), query=intent.detail.get("query"))
+        return LLMToolCall(call_id=call.call_id, name="navigate", arguments={"url": intent.arguments["url"]})
+
+    _PATH_KEYS = ("path", "destination", "source", "directory", "folder", "file", "output_path", "save_path")
+
+    def _remap_other_user_paths(self, call: LLMToolCall) -> LLMToolCall:
+        """'Documents\\X' is the user's Documents, not another profile's.
+
+        The model wrote C:\\Users\\Public\\Documents\\ADVI Bench\\... for "Documents\\ADVI
+        Bench\\...", so Notepad saved where nobody would look (Desktop Suite regression,
+        2026-10-24). A path under another profile is moved to this user's profile when
+        the same folder exists here.
+        """
+        home = Path.home()
+        args = dict(call.arguments)
+        changed = False
+        for key in self._PATH_KEYS:
+            value = args.get(key)
+            if not isinstance(value, str):
+                continue
+            match = re.match(r"^[A-Za-z]:[\\/]+Users[\\/]+(?P<user>[^\\/]+)[\\/]+(?P<rest>.+)$", value)
+            if not match or match.group("user").casefold() == home.name.casefold():
+                continue
+            rest = Path(match.group("rest"))
+            candidate = home / rest
+            anchor = candidate if candidate.exists() else candidate.parent
+            if anchor.exists() and not (Path(value).parent.exists() and Path(value).exists()):
+                args[key] = str(candidate)
+                changed = True
+        if not changed:
+            return call
+        trace("gateway.agent_session.path_remapped", source_component="AgentSession", tool=call.name, arguments=args)
+        return LLMToolCall(call_id=call.call_id, name=call.name, arguments=args)
 
     _BROWSER_APP_NAMES = {"chrome", "google chrome", "browser", "web browser", "the browser", "chromium", "internet"}
 
@@ -4670,7 +5375,8 @@ Rules:
         """Return whether the latest verified execution proves the whole task ended."""
         if self.task is None or self.task.status != TaskStatus.IN_PROGRESS:
             return False
-        if self.task.failed_tools or self.task.uncertain_tools:
+        problems = [n for n in (*self.task.failed_tools, *self.task.uncertain_tools) if n not in self.task.recovered_tools]
+        if problems and not self._superseded_by_later_success(problems):
             return False
 
         goal = str(self.task.goal or getattr(self, "last_user_message", None) or "").casefold()
@@ -4721,19 +5427,25 @@ Rules:
         if last == "email_draft_create" and "send" in goal and "draft" not in goal:
             return False
 
-        terminal_tools = {
-            "create_file", "save_file", "append_file", "replace_file_text",
-            "open_file", "open_folder", "delete_file", "copy_file", "move_file",
-            "rename_file", "copy_folder", "move_folder", "rename_folder",
-            "create_folder", "delete_folder",
-            "close_application", "close_window", "email_draft_create",
-            "email_draft_update", "email_send", "email_reply", "search_file_content",
-            "memory_remember", "memory_forget",
-            "whatsapp_send_message", "whatsapp_open_chat",
-            "telegram_send_message", "telegram_open_chat", "word_create_document",
-            "david_fallback",
-        }
-        if last in terminal_tools:
+        # "Open wikipedia.org": the verified open is the end, even when the
+        # model took one look at the page afterwards. Judging the look instead
+        # answered "I couldn't verify the final state" (Desktop Suite dev run).
+        just_open = bool(re.match(r"^\s*(?:please\s+)?(?:open|go to|visit|launch|show me)\b", goal)) and not re.search(
+            r"\b(?:and|then|search|find|look up|play|watch|listen|type|enter|read|tell|book|buy|check|compare)\b", goal)
+        if is_observation_tool(last):
+            prior = next((o for o in reversed(self.task.tool_outcomes)
+                          if not is_observation_tool(str(o.get("tool") or o.get("name") or ""))), None)
+            if prior is not None and str(prior.get("tool") or prior.get("name") or "") in {"open_browser", "navigate"}:
+                return bool(prior.get("success") and prior.get("verified")) and just_open
+            # Did the work, then looked once more to check (create report.txt, then list
+            # the folder): the verified work is what ended the task (Desktop Suite, 2026-10-24).
+            if (prior is not None and str(prior.get("tool") or prior.get("name") or "") in _TERMINAL_TOOLS
+                    and prior.get("success") and prior.get("verified")):
+                return not _goal_has_more_steps(goal)
+        if last in {"open_browser", "navigate"}:
+            return just_open
+
+        if last in _TERMINAL_TOOLS:
             # "create a folder and move all the PDFs into it": the folder is step one.
             return not _goal_has_more_steps(goal)
         return bool(
@@ -4937,12 +5649,9 @@ Rules:
 
         # The user's quoted replacement is the most reliable signal for a short
         # amendment such as: in subject write "Testing".
-        matches = re.findall(r'["“](.*?)["”]', text)
-        value = matches[-1].strip() if matches else ""
-        if not value:
-            marker = re.search(r"(?:subject|body|message|recipient|email address|to)\s*(?:to|as|write|say|:)?\s+(.+)$", text, re.I)
-            if marker:
-                value = marker.group(1).strip().strip('"“”')
+        # Live log 2026-10-24: "change the body of the email to testing ..." became the
+        # body "of the email to testing ...". The shared parser skips "of the email".
+        value = self._email_edit_value(text)
         if not value:
             return None
 
@@ -4984,6 +5693,114 @@ Rules:
         if self.task is not None:
             self.task.status = TaskStatus.AWAITING_CONFIRMATION
         return AdviResponse(f"Updated the draft. It is now ready to send to {to} with subject '{subject}'. Say yes to send it or no to cancel.")
+
+    @staticmethod
+    def _chat_not_found(result: ToolResult) -> bool:
+        message = f"{result.error or ''} {result.human_readable or ''}".casefold()
+        return "couldn't find" in message and "chat" in message and not (result.metadata or {}).get("candidates")
+
+    def _resolve_chat_spelling(self, text: str) -> AdviResponse | None:
+        """The answer to "could you spell just the name?": rebuild the message and confirm again."""
+        call = getattr(self, "_awaiting_chat_spelling", None)
+        if call is None:
+            return None
+        self._awaiting_chat_spelling = None
+        if _CANCEL_RE.fullmatch(text.strip()) or self._is_natural_cancel(text):
+            if self.task is not None:
+                self.task.status = TaskStatus.CANCELLED
+                self.task.waiting_for = None
+            return AdviResponse("Okay, I won't send it.")
+        old_chat = str(call.arguments.get("chat") or "")
+        spelled = spelled_names(text)
+        name = next((n for n in spelled if n.casefold() != re.sub(r"\W", "", old_chat).casefold()), None)
+        if name is None:
+            name = corrected_name(text, old_chat)
+        if name is None and 0 < len(text.split()) <= 3 and not self._looks_like_independent_new_task(text):
+            name = text.strip(" .!?\"'")  # just the name, said again
+        if not name:
+            return None  # something else entirely; handle it as a new request
+        if not hasattr(self, "_chat_heard_as"):
+            self._chat_heard_as = {}
+        self._chat_heard_as[name.casefold()] = old_chat
+        self._chat_guessed = set()
+        self.pending_confirmation = ToolCall(call_id=f"{call.call_id}-spelled", name=call.name,
+                                             arguments={**dict(call.arguments), "chat": name})
+        if self.task is not None:
+            self.task.status = TaskStatus.AWAITING_CONFIRMATION
+            self.task.waiting_for = None
+        description = self._confirmation_description(self.pending_confirmation).rstrip(".")
+        return AdviResponse(f"Thanks. Before I do that, I need your confirmation: {description}. Say yes to continue or no to cancel.")
+
+    def _apply_word_correction(self, text: str, call: ToolCall) -> AdviResponse | None:
+        """Swap one wrong word in a pending message or email, then ask again."""
+        correction = word_correction(text)
+        if correction is None:
+            return None
+        new, old = correction
+        if call.name in _CHAT_APPS:
+            message = str(call.arguments.get("text") or "")
+            changed = replace_word(message, old, new)
+            if changed is None or changed == message:
+                return None  # not in the message: maybe the name, handled next
+            self.pending_confirmation = ToolCall(call_id=call.call_id, name=call.name,
+                                                 arguments={**dict(call.arguments), "text": changed})
+            description = self._confirmation_description(self.pending_confirmation).rstrip(".")
+            return AdviResponse(f"Okay, I changed '{old}' to '{new}': {description}. Say yes to send it or no to cancel.")
+        if call.name != "email_send":
+            return None
+        draft_id = str(call.arguments.get("draft_id") or (self._last_email_draft or {}).get("draft_id") or "").strip()
+        if not draft_id:
+            return None
+        current = self._run_tool(ToolCall(call_id=f"{call.call_id}-fix-read", name="email_draft_read", arguments={"draft_id": draft_id}))
+        if not current.success:
+            return None
+        values = self._email_draft_values(current.output)
+        to, subject, body = values.get("to", ""), values.get("subject", ""), values.get("body", "")
+        new_subject = replace_word(subject, old, new) if subject else None
+        new_body = replace_word(body, old, new) if body else None
+        if new_subject is None and new_body is None:
+            return AdviResponse(f"I couldn't find '{old}' in the email. Say yes to send it as it is, no to cancel, "
+                                "or tell me the new wording, for example 'change the body to …'.")
+        subject, body = new_subject or subject, new_body or body
+        updated = self._run_tool(ToolCall(call_id=f"{call.call_id}-fix-update", name="email_draft_update",
+                                          arguments={"draft_id": draft_id, "to": to, "subject": subject, "body": body}))
+        if not updated.success:
+            return AdviResponse(updated.error or "I couldn't update the email draft.")
+        self._record_protected_email_update(to, subject, body)
+        self.pending_confirmation = ToolCall(call_id=call.call_id, name=call.name,
+                                             arguments={**dict(call.arguments), "to": to, "subject": subject, "body": body})
+        if self.task is not None:
+            self.task.status = TaskStatus.AWAITING_CONFIRMATION
+        return AdviResponse(f"Okay, I changed '{old}' to '{new}'. The email to {to} now says: {body} "
+                            "Say yes to send it or no to cancel.")
+
+    def _amend_pending_chat(self, text: str, call: ToolCall) -> AdviResponse | None:
+        """Apply a spoken correction of the recipient or text to a pending message, then ask again."""
+        if call.name not in _CHAT_APPS:
+            return None
+        args = dict(call.arguments)
+        old_chat = str(args.get("chat") or "")
+        name = corrected_name(text, old_chat)
+        new_text = corrected_text(text)
+        if not name and not new_text:
+            return None
+        if not hasattr(self, "_chat_heard_as"):
+            self._chat_heard_as = {}
+        if name:
+            # Remember how the name was first heard, so a verified send teaches ADVI the alias.
+            heard = self._chat_heard_as.pop(old_chat.casefold(), None) or old_chat
+            self._chat_heard_as[name.casefold()] = heard
+            self._chat_guessed = set()
+            args["chat"] = name
+        if new_text:
+            args["text"] = new_text
+        self.pending_confirmation = ToolCall(call_id=call.call_id, name=call.name, arguments=args)
+        if self.task is not None:
+            self.task.status = TaskStatus.AWAITING_CONFIRMATION
+        trace("gateway.agent_session.confirmation_amended", source_component="AgentSession",
+              tool=call.name, chat_changed=bool(name), text_changed=bool(new_text))
+        description = self._confirmation_description(self.pending_confirmation).rstrip(".")
+        return AdviResponse(f"Okay, I changed it: {description}. Say yes to send it or no to cancel.")
 
     def _resolve_pending_confirmation(self, text: str) -> AdviResponse | None:
         call = self.pending_confirmation
@@ -5043,6 +5860,17 @@ Rules:
                 return amended
 
         if not _CONFIRM_RE.fullmatch(text):
+            # A correction ("it's S I Y U, not C U", "send it to Siyu instead") changes
+            # the pending action and asks again; live log 2026-10-24 got a rigid
+            # "I need an explicit yes or no" instead.
+            # "It's ADVI, not Adri": one word in the message is wrong (live log
+            # 2026-10-24, where the AI's vague answer let "yes" send the wrong body).
+            swapped = self._apply_word_correction(text, call)
+            if swapped is not None:
+                return swapped
+            amended = self._amend_pending_chat(text, call)
+            if amended is not None:
+                return amended
             # A clearly independent task should not be trapped by an old pending
             # confirmation. Abandon the old proposal locally and let the new task
             # start a fresh execution lifecycle.
@@ -5053,7 +5881,17 @@ Rules:
                     self.task.status = TaskStatus.CANCELLED
                     self.task.context["terminal_reason"] = "superseded_by_new_request"
                 return None
-            return AdviResponse("I need an explicit yes or no before I can perform that action.")
+            # Not yes, no, or a new task: most likely a change or a question about the
+            # action. The AI reads it with the pending action spelled out; a corrected
+            # tool call is confirmed again, and nothing runs without a new yes.
+            self._confirmation_reply_note = (
+                f"[PENDING, NOT DONE] {self._confirmation_description(call).rstrip('.')}. "
+                "The user's message replies to this pending action. If it corrects the action, "
+                "call the tool again with the corrected values (it will be confirmed again). "
+                "If it asks about it, answer and remind them to say yes or no."
+            )
+            self._answered_pending_reply = True
+            return None
 
         self.pending_confirmation = None
         self._ensure_active_task()
@@ -5077,6 +5915,19 @@ Rules:
                 [{"call_id": call.call_id, "name": call.name, "result": result.to_model_payload()}],
             )
         )
+
+        if call.name in _SEND_TOOLS and not result.success:
+            self._last_failed_send = call
+        if call.name in _CHAT_APPS and not result.success and self._chat_not_found(result):
+            # A misheard name ("CU" for "Siyu"): ask for just that word, spelled.
+            self._awaiting_chat_spelling = call
+            self.task.status = TaskStatus.AWAITING_INPUT
+            self.task.waiting_for = "the chat name, spelled"
+            app = "Telegram" if call.name == "telegram_send_message" else "WhatsApp"
+            return AdviResponse(
+                f"I couldn't find a {app} chat named '{call.arguments.get('chat')}'. "
+                "Could you spell just the name, letter by letter?"
+            )
 
         if not result.success or not result.verified:
             # A native Gmail failure with an explicit fallback recommendation is
@@ -5303,6 +6154,9 @@ Rules:
                 reason = "the AI service is rate-limited" + (wait_text or ", so wait about a minute")
         elif isinstance(exc, LLMTimeoutError):
             reason = "the language provider timed out"
+        elif isinstance(exc, LLMRequestError) and "failed to parse tool call" in message:
+            # The model garbled its own answer; that is chance, not a bug, and a retry usually works.
+            reason = "the AI's answer came back garbled; please say that again"
         elif isinstance(exc, LLMRequestError):
             reason = "the language provider rejected my request, which is a bug on my side and is in the log"
         else:
@@ -5323,13 +6177,29 @@ Rules:
 
     def _friendly_provider_failure(self, exc: Exception) -> str:
         reason = self._describe_provider_failure(exc)
-        if self.task is None:
-            return f"I couldn't respond just now: {reason}. Simple commands still work without it: opening apps and websites, searching a site, playing or pausing music, file moves and undo, and WhatsApp, Telegram or email with your confirmation."
+        if self.pending_confirmation is not None:
+            # The AI was asked to read a reply to a pending action and couldn't;
+            # the action is still waiting, so say how to answer it without the AI.
+            self._confirmation_reply_note = None
+            description = self._confirmation_description(self.pending_confirmation).rstrip(".")
+            example = " or tell me the change, for example 'send it to Siyu instead'" if self.pending_confirmation.name in _CHAT_APPS else ""
+            return (f"I couldn't work out that reply without the AI ({reason}). Still waiting to {description}. "
+                    f"Say yes to do it, no to cancel{example}.")
+        if self.task is None or not self.task.tool_outcomes:
+            # Live log 2026-10-24: "simple commands still work" was followed by simple
+            # commands that didn't. Say plainly this one needs the AI, and give
+            # phrasings that really work offline.
+            return (
+                f"I couldn't do that one: it needs the AI, and {reason}. Without the AI I understand simple commands, "
+                "for example: 'open notepad', 'play Believer on YouTube', 'send hi to Mom on WhatsApp', "
+                "'what time is it', 'pause', 'volume up', or 'open my downloads folder'."
+            )
         return f"I couldn't continue that task just now: {reason}. Your progress is preserved; say try again."
 
     _DIAGNOSIS_RE = re.compile(
         r"^(?:what(?:'s| is| was)? (?:the )?(?:problem|issue|wrong|error)|what happened|why(?: did(?: it| that| you)?)? (?:fail|not work|stop)|"
-        r"why (?:is|isn't|aren't) (?:it|this|that) working|what went wrong|damn(?: it)?|what the hell|wtf|come on)\b",
+        r"why (?:is|isn't|aren't) (?:it|this|that) working|what went wrong|damn(?: it)?|what the hell|wtf|come on|"
+        r"why (?:couldn't|could not|didn't|did not|can't|cannot|won't|wouldn't) you)\b",
         re.I,
     )
     _CANCEL_REQUEST_RE = re.compile(
@@ -5339,6 +6209,32 @@ Rules:
         r"^(?:stop|stop it|stop that|stop talking|shut up|shut it|shut p|be quiet|quiet|silence|enough|cancel|never mind|nevermind|abort)$",
         re.I,
     )
+
+    # About ADVI itself only; "why is my laptop slow" is a real task for the tools.
+    _SLOW_RE = re.compile(
+        r"^(?:(?:why|how come)(?:'s| is| are| r| was| were| do| does| did)? ?(?:you|u|advi|it|this|that|voice|everything|things) "
+        r"(?:(?:being|so|this|that|running|responding|answering|really|very) )*(?:slow|slowly|late|lagging|laggy|taking (?:so |this |that )?long)"
+        r"|why (?:did|does|do) (?:it|that|this|you) take so long"
+        r"|(?:you(?:'re| are)|advi is|it'?s|this is) (?:(?:so|too|very|really|being) )*(?:slow|laggy|lagging))\b",
+        re.I,
+    )
+
+    def _handle_slowness_question(self, text: str) -> AdviResponse | None:
+        """Answer "why are you slow?" from what ADVI knows, without needing the AI."""
+        normalized = re.sub(r"\s+", " ", str(text or "").casefold().replace("’", "'").strip().rstrip("?.! "))
+        if not self._SLOW_RE.match(normalized):
+            return None
+        reasons = []
+        status = getattr(self, "speech_status", None)
+        voice = status() if callable(status) else None
+        if voice:
+            reasons.append(voice)
+        failure = getattr(self, "_last_failure", None)
+        if failure and time.monotonic() - float(failure.get("at") or 0) <= 900:
+            reasons.append(f"Also, the AI service had trouble recently: {failure['reason']}.")
+        if not reasons:
+            return None  # nothing known locally; the AI answers with the usual context
+        return AdviResponse(" ".join(reasons))
 
     def _handle_local_diagnosis(self, text: str) -> AdviResponse | None:
         """Explain the most recent failure without needing the failed service."""
@@ -5352,6 +6248,28 @@ Rules:
         goal = f" The interrupted request was: {failure['goal']}." if failure.get("goal") else ""
         return AdviResponse(f"The problem is that {failure['reason']}.{detail}{goal}")
 
+    def _superseded_by_later_success(self, failed: list[str]) -> bool:
+        """A harmless wrong step doesn't fail a task that a later verified step finished.
+
+        Desktop Suite dev run (2026-10-23): open_folder on a *file* failed, read,
+        count and save then all succeeded, and the user heard "I couldn't complete
+        that: Saved file 'example_count.txt'". Only low/medium side-effect
+        failures (nothing was changed) are superseded; a failed send, delete or
+        typing step never is.
+        """
+        outcomes = list(self.task.tool_outcomes) if self.task is not None else []
+        if not outcomes or not (outcomes[-1].get("success") and outcomes[-1].get("verified")):
+            return False
+        # The finishing step must have done the work (saved, moved, created), not
+        # merely looked: a failed "open X" followed by a listing is still a failure.
+        if is_observation_tool(str(outcomes[-1].get("tool") or outcomes[-1].get("name") or "")):
+            return False
+        for name in failed:
+            spec = self.tools.get(name) if self.tools is not None else None
+            if getattr(spec, "side_effect", "high") not in {"low", "medium"}:
+                return False
+        return True
+
     def _finalize_task_status(self) -> None:
         """Reconcile task state from execution evidence, never model prose alone."""
         if self.task is None:
@@ -5360,11 +6278,14 @@ Rules:
             name for name in self.task.failed_tools
             if name not in self.task.recovered_tools
         ]
+        if unrecovered_failures and self._superseded_by_later_success(unrecovered_failures):
+            unrecovered_failures = []
         if unrecovered_failures:
             self.task.status = TaskStatus.FAILED
             self.task.context["completion_evidence"] = "unrecovered_tool_failure"
             return
-        if self.task.uncertain_tools:
+        uncertain = [n for n in self.task.uncertain_tools if n not in self.task.recovered_tools]
+        if uncertain and not self._superseded_by_later_success(uncertain):
             self.task.status = TaskStatus.UNCERTAIN
             self.task.context["completion_evidence"] = "uncertain_tool_result"
             return
@@ -5490,16 +6411,35 @@ Rules:
 
     def _confirmation_description(self, call: ToolCall) -> str:
         if call.name == "email_send":
+            # Live log: "send an email to the saved recipient with subject 'Testing
+            # Email'" asked for a yes without saying who or what. Say both.
             to = call.arguments.get("to") or ""
             subject = call.arguments.get("subject") or ""
+            body = call.arguments.get("body") or ""
+            draft = getattr(self, "_last_email_draft", None) or {}
             if self.task is not None:
                 to = to or str(self.task.artifacts.get("to") or self.task.artifacts.get("recipient") or "")
                 subject = subject or str(self.task.artifacts.get("subject") or "")
-            to = to or "the saved recipient"
-            subject = subject or "(no subject)"
-            return f"send an email to {to} with subject '{subject}'"
+                body = body or str(self.task.artifacts.get("body") or "")
+            to = to or str(draft.get("to") or "") or "the saved recipient"
+            subject = subject or str(draft.get("subject") or "")
+            body = body or str(draft.get("body") or "")
+            text = f"send an email to {to}"
+            if subject:
+                text += f" with subject '{subject}'"
+            if body:
+                text += f" saying '{body[:160]}'"
+            return text
         if call.name == "email_reply":
             return f"reply to the selected email with message '{str(call.arguments.get('body') or "")[:120]}'"
+        if call.name == "email_forward":
+            note = str(call.arguments.get("note") or call.arguments.get("body") or "")
+            which = self._email_subject_for(str(call.arguments.get("message_id") or ""))
+            return (f"forward the email{f' {which}' if which else ''} to {call.arguments.get('to') or 'the recipient'}"
+                    + (f" with the note '{note[:120]}'" if note else ""))
+        if call.name == "email_trash":
+            subject = self._email_subject_for(str(call.arguments.get("message_id") or ""))
+            return f"move the email{f' {subject}' if subject else ''} to Trash"
         if call.name == "delete_file":
             return f"delete {call.arguments.get('path', 'the selected file')}"
         if call.name == "memory_forget":
@@ -5508,13 +6448,102 @@ Rules:
             reason = getattr(self, "_pending_confirmation_reason", None)
             if reason:
                 return reason
-        if call.name == "telegram_send_message":
-            return f"send the Telegram message '{str(call.arguments.get('text') or '')[:160]}' to {call.arguments.get('chat') or 'the chat'}"
-        if call.name == "whatsapp_send_message":
-            return f"send the WhatsApp message '{str(call.arguments.get('text') or '')[:160]}' to {call.arguments.get('chat') or 'the chat'}"
+        if call.name in _CHAT_APPS:
+            app = "Telegram" if call.name == "telegram_send_message" else "WhatsApp"
+            chat = call.arguments.get("chat") or "the chat"
+            # Only a name ADVI swapped itself is flagged; a name the user corrected is theirs.
+            guessed = str(chat).casefold() in getattr(self, "_chat_guessed", set())
+            heard = getattr(self, "_chat_heard_as", {}).get(str(chat).casefold()) if guessed else None
+            heard_note = f" (I heard '{heard}')" if heard and heard.casefold() != str(chat).casefold() else ""
+            return f"send the {app} message '{str(call.arguments.get('text') or '')[:160]}' to {chat}{heard_note}"
         return f"run the {call.name} action"
 
+    _REFERS_BACK = re.compile(
+        r"\b(?:this|that|the same|your|above|previous|last|you just|what you (?:said|wrote|told|gave))\b.{0,40}?"
+        r"\b(?:speech|story|poem|essay|letter|text|answer|summary|list|reply|recipe|notes?|article|content|it)\b"
+        r"|\b(?:you just (?:gave|said|wrote|told)|what you just)\b",
+        re.I,
+    )
+
+    def _previous_answer_for(self, text: str) -> str:
+        """The whole previous answer when the user points back at it.
+
+        "Put this speech into a PDF" after a 1,200-word speech got "I don't have the
+        speech text yet" (live log 2026-10-24): rebuilt AI sessions keep only the
+        first 500-1,200 characters of ADVI's last answer.
+        """
+        stored = getattr(self, "_last_long_answer", None)
+        if not stored or time.monotonic() - stored[0] > 900 or not self._REFERS_BACK.search(str(text or "")):
+            return ""
+        return stored[1][:6000]
+
+    def _fresh_notepad_tab(self, opened: ToolResult) -> None:
+        """Windows 11 Notepad reopens old unsaved tabs; typing then joins the old text
+        ("This is a draft.This is a draft.", Desktop Suite 2026-10-24). Start a new tab."""
+        title = str((opened.metadata or {}).get("application_session", {}).get("window", {}).get("title")
+                    or self._foreground_title() or "")
+        if title.startswith("Untitled - ") or self.tools.get("hotkey") is None:
+            return
+        self.tool_runner.run(ToolCall(call_id=f"notepad-{uuid.uuid4().hex[:10]}", name="hotkey", arguments={"keys": ["ctrl", "n"]}))
+        time.sleep(0.4)
+
+    def _email_subject_for(self, message_id: str) -> str:
+        """'"Statement" from bank@example.com' for an email ADVI has read, so a confirmation names it."""
+        item = getattr(self, "_email_index", {}).get(message_id)
+        if not item:
+            return ""
+        subject = f"'{item['subject']}'" if item.get("subject") else ""
+        sender = f"from {item['from']}" if item.get("from") else ""
+        return " ".join(part for part in (subject, sender) if part)
+
+    # --- chat names heard by voice ------------------------------------------------
+
+    def _chat_store(self) -> Any:
+        return getattr(self.memory, "memory", None) if self.memory is not None else None
+
+    def _resolve_spoken_chat(self, call: ToolCall) -> ToolCall:
+        """Map a heard chat name onto a chat ADVI already knows ("CU" -> "Siyu")."""
+        app = _CHAT_APPS.get(call.name)
+        chat = str(call.arguments.get("chat") or "").strip()
+        if not app or not chat:
+            return call
+        if not hasattr(self, "_chat_heard_as"):
+            self._chat_heard_as = {}
+        try:
+            store = self._chat_store()
+            known = store.known_chats(app) if store is not None and hasattr(store, "known_chats") else []
+        except Exception:
+            logger.debug("Known chats could not be read", exc_info=True)
+            known = []
+        name, how = resolve_chat(chat, known)
+        if how in {"alias", "sounds_like"} and name != chat:
+            self._chat_heard_as[name.casefold()] = chat
+            self._chat_guessed = {name.casefold()}
+            trace("gateway.agent_session.chat_resolved", source_component="AgentSession", heard=chat, name=name, how=how)
+            return ToolCall(call_id=call.call_id, name=call.name, arguments={**dict(call.arguments), "chat": name})
+        return call
+
+    def _learn_chat(self, call: ToolCall, result: ToolResult) -> None:
+        """After a verified send, remember the chat (and how it was misheard, if it was)."""
+        app = _CHAT_APPS.get(call.name)
+        if not app or not (result.success and result.verified):
+            return
+        chat = str(call.arguments.get("chat") or "").strip()
+        title = str((result.metadata or {}).get("chat_title") or chat).strip()
+        heard = getattr(self, "_chat_heard_as", {}).get(chat.casefold(), "")
+        store = self._chat_store()
+        if store is None or not hasattr(store, "remember_chat") or not title:
+            return
+        try:
+            store.remember_chat(app, title, heard_as=heard)
+            if title.casefold() != chat.casefold():
+                store.remember_chat(app, title, heard_as=chat)
+        except Exception:
+            logger.debug("Chat name could not be saved", exc_info=True)
+
     def _record(self, role: str, content: str) -> None:
+        if role == "assistant" and len(str(content or "")) > 1000:
+            self._last_long_answer = (time.monotonic(), str(content))
         if self.session_buffer is not None and hasattr(self.session_buffer, "add"):
             try:
                 self.session_buffer.add([{"role": role, "content": content}])
@@ -5575,11 +6604,34 @@ def _local_media_match(query: str) -> Path | None:
     return None
 
 
+_SEND_TOOLS = {"whatsapp_send_message", "telegram_send_message", "email_send", "email_reply", "email_forward", "david_fallback"}
+_CHAT_APPS = {"whatsapp_send_message": "whatsapp", "telegram_send_message": "telegram"}
+# Several calls of one of these with different arguments can run in one round.
+_INDEPENDENT_BATCH_TOOLS = frozenset({"create_folder", "create_file", "copy_file", "copy_folder"})
+# A verified result from one of these ends a task, unless the request asked for more.
+_TERMINAL_TOOLS = frozenset({
+    "create_file", "save_file", "append_file", "replace_file_text",
+    "open_file", "open_folder", "delete_file", "copy_file", "move_file",
+    "rename_file", "copy_folder", "move_folder", "rename_folder",
+    "create_folder", "delete_folder", "remove_empty_folders", "zip_files", "set_file_hidden",
+    "close_application", "close_window", "email_draft_create",
+    "email_draft_update", "email_send", "email_reply", "search_file_content",
+    "email_forward", "email_trash", "email_archive", "email_mark",
+    "memory_remember", "memory_forget",
+    "whatsapp_send_message", "whatsapp_open_chat",
+    "telegram_send_message", "telegram_open_chat", "word_create_document",
+    "david_fallback",
+    # A verified pause / next / volume change is the whole request; it was answered
+    # "couldn't verify the final state: Paused." (capability sweep, 2026-10-25).
+    "media_control", "remove_empty_folders",
+})
+_CHAT_TOOLS = {"whatsapp_send_message", "whatsapp_open_chat", "telegram_send_message", "telegram_open_chat"}
 _SELF_VERIFYING_TOOLS = {"word_create_document", "whatsapp_send_message", "whatsapp_open_chat", "telegram_send_message", "telegram_open_chat", "play_media", "play_local_media"}
 _FAMILY_TOOLS = {
     OperationFamily.MEDIA_PLAYBACK: {"click_web_element", "play_media", "search", "navigate"},
     OperationFamily.STRUCTURED_DOCUMENT: {"create_file", "save_file"},
-    OperationFamily.EMAIL_WORKFLOW: {"email_draft_create", "email_draft_update", "email_send", "email_reply", "david_fallback", "contact_lookup", "email_read"},
+    OperationFamily.EMAIL_WORKFLOW: {"email_draft_create", "email_draft_update", "email_send", "email_reply", "david_fallback", "contact_lookup", "email_read",
+                                     "email_forward", "email_trash", "email_archive", "email_mark"},
     OperationFamily.BROWSER_WORKFLOW: {"search", "navigate", "click_web_element", "type_web_element", "read_web_page", "research_web", "inspect_web_page"},
 }
 _BULK_FILE_TOOLS = {"move_files", "organize_folder", "undo_file_operation"}
@@ -5587,7 +6639,10 @@ _BULK_FILE_TOOLS = {"move_files", "organize_folder", "undo_file_operation"}
 _MORE_STEPS_RE = re.compile(
     r"\b(?:and then|then|after that|afterwards|followed by|next)\b|"
     r"\b(?:organi[sz]e|sort|arrange|categori[sz]e)\b|"
-    r"\b(?:move|copy|put)\s+(?:all|every|each|these|those|this|the)\b"
+    # Only as a later step ("create a folder and move all the PDFs into it"); a request
+    # that *is* the move ("Move the folder MyFolder ...") was left "unverified" after a
+    # verified move (Desktop Suite regression, 2026-10-24).
+    r"(?:\band|,|\bthen)\s+(?:also\s+)?(?:move|copy|put)\s+(?:all|every|each|these|those|this|the|them|it)\b"
 )
 
 

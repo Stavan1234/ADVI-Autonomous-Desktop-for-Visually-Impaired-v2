@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "advi-desktop-agent"
-version = "0.3.4"
+version = "0.4.0"
 description = "ADVI — Autonomous Desktop for Visually Impaired"
 requires-python = ">=3.13,<3.14"
 readme = "README.md"
@@ -18,6 +18,10 @@ dependencies = [
     "psutil>=7.0.0,<8.0.0",
     "pydantic>=2.0.0",
     "pywinauto>=0.6.8",
+    # Imported directly (Word automation via win32com, window/process helpers, the
+    # output level meter via comtypes); pywinauto also pulls them in on Windows.
+    "pywin32>=306; sys_platform == 'win32'",
+    "comtypes>=1.4.0; sys_platform == 'win32'",
     "pyautogui>=0.9.54",
     "websocket-client>=1.8.0",
     "tzdata>=2024.1",
@@ -33,6 +37,11 @@ dependencies = [
     "playwright>=1.64.0,<2.0.0",
     "sentence-transformers>=6.1.0,<7.0.0",
     "numpy>=2.0.0",
+    # Voice input: microphone capture and local Whisper (includes Silero VAD).
+    "sounddevice>=0.5.0",
+    "faster-whisper>=1.1.0,<2.0.0",
+    # Echo cancellation: WebRTC's audio processing module (AEC3), bundled by LiveKit.
+    "livekit>=1.1.21,<2.0.0",
 ]
 
 [project.optional-dependencies]

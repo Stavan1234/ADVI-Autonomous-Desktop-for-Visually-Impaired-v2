@@ -93,6 +93,7 @@ class MemoryRetriever:
                     query,
                     normalize_embeddings=True,
                     convert_to_numpy=True,
+                    show_progress_bar=False,
                 )
             )
         return np.asarray(
@@ -100,6 +101,7 @@ class MemoryRetriever:
                 query,
                 normalize_embeddings=True,
                 convert_to_numpy=True,
+                show_progress_bar=False,
             )
         )
 
@@ -114,6 +116,7 @@ class MemoryRetriever:
                     texts,
                     normalize_embeddings=True,
                     convert_to_numpy=True,
+                    show_progress_bar=False,
                 )
             )
         return np.asarray(
@@ -121,6 +124,7 @@ class MemoryRetriever:
                 texts,
                 normalize_embeddings=True,
                 convert_to_numpy=True,
+                show_progress_bar=False,
             )
         )
 

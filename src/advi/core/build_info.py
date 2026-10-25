@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-RELEASE_ID = "0.3.4-final-reliability"
+RELEASE_ID = "0.4.0-voice-and-capability-sweep"
 
 
 def source_fingerprint(project_root: Path | None = None) -> str:

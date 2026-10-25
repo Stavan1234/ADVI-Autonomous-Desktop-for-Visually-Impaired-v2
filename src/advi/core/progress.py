@@ -19,7 +19,7 @@ from typing import Any
 
 # Observations that describe what is currently on screen. File/app discovery
 # results are not screen state and are deliberately excluded.
-SCREEN_OBSERVATION_TOOLS = frozenset({"read_screen", "inspect_window", "inspect_web_page", "read_web_page", "observe_window"})
+SCREEN_OBSERVATION_TOOLS = frozenset({"read_screen", "inspect_window", "inspect_web_page", "read_web_page", "observe_window", "look_at_screen"})
 
 # Normalized similarity at or above this means "the screen did not change".
 # OCR of an unchanged window varies slightly between captures (cursor, clock).

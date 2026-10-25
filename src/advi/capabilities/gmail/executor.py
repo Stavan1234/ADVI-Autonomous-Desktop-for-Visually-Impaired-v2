@@ -45,6 +45,10 @@ class GmailCapability:
         "email_send",
         "email_reply",
         "email_read",
+        "email_forward",
+        "email_trash",
+        "email_archive",
+        "email_mark",
     }
 
     def __init__(self, service: GmailService | None = None) -> None:
@@ -321,6 +325,82 @@ class GmailCapability:
             verification_status="verified" if verified else "uncertain",
             verification_details=verification_detail,
             metadata={"message_id": sent_id, "in_reply_to": message_id},
+        )
+
+    def _message_id(self, action: ToolCall) -> str:
+        message_id = str(action.parameters.get("message_id") or action.parameters.get("id") or "").strip()
+        if not message_id:
+            raise ValueError("A message_id from email_read is required.")
+        return message_id
+
+    def _labels_after(self, message_id: str) -> set[str]:
+        fetched = self.service.get_message(message_id)
+        return set(fetched.get("labelIds") or []) if isinstance(fetched, dict) else set()
+
+    def _execute_email_forward(self, action: ToolCall) -> ToolResult:
+        message_id = self._message_id(action)
+        to = str(action.parameters.get("to") or action.parameters.get("recipient") or "").strip()
+        if not to:
+            raise ValueError("Forwarding needs a recipient email address.")
+        note = str(action.parameters.get("note") or action.parameters.get("body") or "")
+        sent = self.service.forward_message(message_id, to, note)
+        sent_id = sent.get("id", "") if isinstance(sent, dict) else ""
+        verified = False
+        if sent_id:
+            try:
+                verified = bool(self.service.get_message(sent_id).get("id") == sent_id)
+            except Exception:
+                verified = False
+        return ToolResult(
+            call_id=action.call_id, name=action.action, success=bool(sent_id), output=sent,
+            human_readable=f"Forwarded the email to {to}.", verified=verified,
+            verification_status="verified" if verified else "uncertain",
+            verification_details={"message_id": sent_id, "forwarded": message_id},
+            metadata={"message_id": sent_id, "recipient": to, "forwarded": message_id},
+        )
+
+    def _execute_email_trash(self, action: ToolCall) -> ToolResult:
+        message_id = self._message_id(action)
+        self.service.trash_message(message_id)
+        verified = "TRASH" in self._labels_after(message_id)
+        return ToolResult(
+            call_id=action.call_id, name=action.action, success=verified,
+            human_readable="Moved the email to Trash; Gmail keeps it there for 30 days." if verified else None,
+            error=None if verified else "Gmail didn't confirm the email is in Trash.",
+            verified=True, verification_status="verified" if verified else "failed",
+            verification_details={"method": "gmail_labels", "message_id": message_id, "in_trash": verified},
+            metadata={"message_id": message_id},
+        )
+
+    def _execute_email_archive(self, action: ToolCall) -> ToolResult:
+        message_id = self._message_id(action)
+        self.service.modify_labels(message_id, remove=["INBOX"])
+        archived = "INBOX" not in self._labels_after(message_id)
+        return ToolResult(
+            call_id=action.call_id, name=action.action, success=archived,
+            human_readable="Archived the email; it's out of the inbox but still in All Mail." if archived else None,
+            error=None if archived else "Gmail still shows the email in the inbox.",
+            verified=True, verification_status="verified" if archived else "failed",
+            verification_details={"method": "gmail_labels", "message_id": message_id, "archived": archived},
+            metadata={"message_id": message_id},
+        )
+
+    def _execute_email_mark(self, action: ToolCall) -> ToolResult:
+        message_id = self._message_id(action)
+        state = str(action.parameters.get("state") or "read").strip().casefold()
+        if state not in {"read", "unread", "starred", "unstarred"}:
+            raise ValueError("state must be read, unread, starred or unstarred.")
+        label = "STARRED" if "star" in state else "UNREAD"
+        want = state in {"unread", "starred"}
+        self.service.modify_labels(message_id, add=[label] if want else [], remove=[] if want else [label])
+        done = (label in self._labels_after(message_id)) == want
+        return ToolResult(
+            call_id=action.call_id, name=action.action, success=done,
+            human_readable=f"Marked the email as {state}." if done else None,
+            error=None if done else f"Gmail didn't confirm the email is {state}.",
+            verified=True, verification_status="verified" if done else "failed",
+            verification_details={"method": "gmail_labels", "message_id": message_id, "state": state},
+            metadata={"message_id": message_id, "state": state},
         )
 
     def _execute_email_read(self, action: ToolCall) -> ToolResult:

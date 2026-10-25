@@ -4,6 +4,7 @@ import ctypes
 import logging
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 import re
 
@@ -45,6 +46,43 @@ _KNOWN_APP_PROCESSES: dict[str, tuple[str, ...]] = {
 }
 
 
+_CLIPBOARD_API = None
+
+
+def _clipboard_api():
+    """user32/kernel32 with 64-bit-safe signatures for the clipboard calls.
+
+    With ctypes' default int return type, GetClipboardData/GlobalAlloc handles
+    were truncated to 32 bits and GlobalLock read a bad address: "Windows fatal
+    exception: access violation" in _windows_clipboard_text (fresh-install test run).
+    Private WinDLL instances keep these signatures away from other libraries.
+    """
+    global _CLIPBOARD_API
+    if _CLIPBOARD_API is None:
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        user32.OpenClipboard.argtypes = [wintypes.HWND]
+        user32.OpenClipboard.restype = wintypes.BOOL
+        user32.CloseClipboard.restype = wintypes.BOOL
+        user32.EmptyClipboard.restype = wintypes.BOOL
+        user32.GetClipboardData.argtypes = [wintypes.UINT]
+        user32.GetClipboardData.restype = wintypes.HANDLE
+        user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+        user32.SetClipboardData.restype = wintypes.HANDLE
+        kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+        kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+        kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalUnlock.restype = wintypes.BOOL
+        kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalFree.restype = wintypes.HGLOBAL
+        _CLIPBOARD_API = (user32, kernel32)
+    return _CLIPBOARD_API
+
+
 class DesktopCapability:
     """
     Desktop & OS Automation Capability.
@@ -74,6 +112,7 @@ class DesktopCapability:
         "list_windows",
         "inspect_window",
         "read_screen",
+        "look_at_screen",
     }
 
     def __init__(
@@ -81,10 +120,13 @@ class DesktopCapability:
         context: DesktopContext | None = None,
         perception: ScreenPerception | None = None,
         environment_watchtower: Any | None = None,
+        screen_describer: Any | None = None,
     ) -> None:
         self.context = context or DesktopContext()
         self.perception = perception or ScreenPerception(desktop_context=self.context)
         self.environment_watchtower = environment_watchtower
+        self._screen_describer = screen_describer
+        self._describer_loaded = screen_describer is not None
 
     def execute(self, action: ToolCall, *, approval_granted: bool = False) -> ToolResult:
         handler = getattr(self, f"_execute_{action.action}", None)
@@ -1295,6 +1337,73 @@ class DesktopCapability:
             metadata={"hwnd": int(hwnd), "target": target, "control_count": len(controls)},
         )
 
+    @property
+    def screen_describer(self) -> Any | None:
+        if not self._describer_loaded:
+            from .screen_describer import describer_from_settings
+
+            self._screen_describer = describer_from_settings()
+            self._describer_loaded = True
+        return self._screen_describer
+
+    def _execute_look_at_screen(self, action: ToolCall) -> ToolResult:
+        """Ask the vision model about the screen; OCR text when vision is unavailable.
+
+        The answer is an observation of the screen, never proof that a task
+        succeeded, and never a place to click.
+        """
+        params = action.parameters
+        question = str(params.get("question") or "").strip() or None
+        application = str(params.get("application") or params.get("app") or params.get("window") or "").strip() or None
+        if application is None and not params.get("foreground"):
+            # "What's on my screen" means the whole screen; automatic looks
+            # pass foreground=True and only send the window ADVI is working in.
+            application = "full_screen"
+
+        describer = self.screen_describer
+        vision_error = "no Gemini API key is configured" if describer is None else None
+        if describer is not None:
+            try:
+                shot = self.perception.window_image(application)
+                answer, cached = describer.describe(shot["image"], question, window_title=shot["window"])
+            except Exception as exc:
+                logger.info("look_at_screen vision failed: %s", exc)
+                vision_error = str(exc)
+            else:
+                note = "" if shot["settled"] else " (The screen was still changing when I looked.)"
+                return ToolResult(
+                    call_id=action.call_id,
+                    name=action.action,
+                    success=True,
+                    output=answer + note,
+                    human_readable=answer + note,
+                    verified=True,
+                    verification_status="verified",
+                    verification_details={"method": "vision_model", "evidence": "visual_observation_only"},
+                    metadata={
+                        "scope": shot["scope"], "window": shot["window"], "settled": shot["settled"],
+                        "model": getattr(describer, "model", None), "cached": cached, "question": question,
+                    },
+                )
+
+        if params.get("foreground"):
+            # Automatic looks come after a structured observation already ran;
+            # OCR would only repeat it.
+            return ToolResult(
+                call_id=action.call_id, name=action.action, success=False,
+                error=f"Vision is unavailable: {vision_error}", metadata={"vision_error": vision_error},
+            )
+        ocr = self._execute_read_screen(ToolCall(
+            call_id=action.call_id,
+            name="read_screen",
+            arguments={"application": None if application == "full_screen" else application},
+        ))
+        if not ocr.success:
+            return replace(ocr, name=action.action, error=f"I couldn't look at the screen ({vision_error}), and {ocr.error}")
+        text = f"I couldn't get a picture description ({vision_error}), but this is the text I can read: {ocr.output}"
+        return replace(ocr, name=action.action, output=text, human_readable=text,
+                       metadata={**dict(ocr.metadata or {}), "vision_error": vision_error})
+
     def _execute_read_screen(self, action: ToolCall) -> ToolResult:
         """Read visible screen text through the existing OCR perception layer."""
         application = (
@@ -1852,17 +1961,15 @@ class DesktopCapability:
         """Read plain Unicode text from the Windows clipboard, when available."""
         if os.name != "nt":
             return None
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
+        user32, kernel32 = _clipboard_api()
         CF_UNICODETEXT = 13
         try:
-            if not user32.OpenClipboard(0):
+            if not user32.OpenClipboard(None):
                 return None
             try:
                 handle = user32.GetClipboardData(CF_UNICODETEXT)
                 if not handle:
                     return None
-                kernel32.GlobalLock.restype = ctypes.c_void_p
                 ptr = kernel32.GlobalLock(handle)
                 if not ptr:
                     return None
@@ -1880,22 +1987,20 @@ class DesktopCapability:
         """Replace the Windows clipboard with Unicode text without external dependencies."""
         if os.name != "nt":
             return False
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
+        user32, kernel32 = _clipboard_api()
         CF_UNICODETEXT = 13
         GMEM_MOVEABLE = 0x0002
         GMEM_ZEROINIT = 0x0040
         data = (str(text) + "\x00").encode("utf-16-le")
         handle = None
         try:
-            if not user32.OpenClipboard(0):
+            if not user32.OpenClipboard(None):
                 return False
             try:
                 user32.EmptyClipboard()
                 handle = kernel32.GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, len(data))
                 if not handle:
                     return False
-                kernel32.GlobalLock.restype = ctypes.c_void_p
                 ptr = kernel32.GlobalLock(handle)
                 if not ptr:
                     kernel32.GlobalFree(handle)
@@ -2357,7 +2462,11 @@ class DesktopCapability:
             )
 
         duration = float(action.parameters.get("duration") or action.parameters.get("seconds") or 1.0)
-        time.sleep(max(0.1, min(duration, 30.0)))
+        if "milliseconds" in action.parameters or (duration > 60 and "seconds" not in action.parameters):
+            # The model sends 1000 meaning one second; "Waited for 1000.0s" (sweep, 2026-10-25).
+            duration = float(action.parameters.get("milliseconds") or duration) / 1000.0
+        duration = max(0.1, min(duration, 30.0))
+        time.sleep(duration)
         return ToolResult(
             call_id=action.call_id,
             name=action.action,

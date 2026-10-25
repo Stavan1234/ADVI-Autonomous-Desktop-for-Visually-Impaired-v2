@@ -48,6 +48,11 @@ class OfficeCapability:
         blocks = word.parse_blocks(content, title)
         doc_title = next((b.text for b in blocks if b.kind == "title"), "") or title or "Document"
         safe_title = re.sub(r'[<>:"/\\|?*]+', " ", word.inline_spans(doc_title)[0]).strip()[:80] or "Document"
+        # The file name the user said ("save it as a PDF named Water") wins over
+        # the heading: the benchmark's "Water.pdf" came out as "Drinking Water.pdf".
+        spoken_name = re.sub(r'[<>:"/\\|?*]+', " ", str(params.get("name") or "")).strip()[:80]
+        if spoken_name:
+            safe_title = spoken_name
         target = self._resolve(raw_path)
         # "save it as a pdf in documents/ADVI Test" (a folder) produced
         # "Documents/ADVI Test.pdf" next to the folder. A folder means inside it.
@@ -55,6 +60,8 @@ class OfficeCapability:
             target = target / safe_title
         elif target.suffix.lower() in {".docx", ".pdf", ".doc"} and target.with_suffix("").is_dir():
             target = target.with_suffix("") / f"{safe_title}{target.suffix.lower()}"
+        elif spoken_name and target.stem.casefold() != spoken_name.casefold():
+            target = target.with_name(spoken_name + target.suffix)
         suffix = target.suffix.lower()
         if suffix not in {".docx", ".pdf"}:
             # "report.doc", "notes" or "speech.txt" asked of Word -> a .docx
@@ -79,6 +86,10 @@ class OfficeCapability:
             missing = [t for t in expected if word.inline_spans(t)[0] not in check["text"]]
             if missing:
                 return fail(f"Saved {target.name}, but it is missing: {', '.join(missing)}.")
+            # A table must come out as a real Word table, never as "| a | b |" text.
+            wanted_tables = sum(1 for b in blocks if b.kind == "table")
+            if check.get("tables", 0) < wanted_tables or check.get("literal_pipes", 0):
+                return fail(f"Saved {target.name}, but its table didn't come out as a real Word table.")
 
         opened = False
         if params.get("open", True) not in (False, "false", "no", 0):

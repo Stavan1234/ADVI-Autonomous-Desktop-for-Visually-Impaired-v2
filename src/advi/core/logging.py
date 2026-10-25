@@ -74,7 +74,12 @@ def configure_logging(log_root: Path) -> None:
         console.setFormatter(AdviFormatter())
         root.addHandler(console)
 
-        file_handler = logging.FileHandler(log_root / "advi.log", encoding="utf-8")
+        # Appended forever before (8.6 MB on the dev machine, with task details in it);
+        # now capped at 20 MB plus three older files (advi.log.1 .. .3).
+        from logging.handlers import RotatingFileHandler
+
+        file_handler = RotatingFileHandler(log_root / "advi.log", maxBytes=20 * 1024 * 1024, backupCount=3,
+                                           encoding="utf-8", delay=True)
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(AdviFileFormatter())
         root.addHandler(file_handler)

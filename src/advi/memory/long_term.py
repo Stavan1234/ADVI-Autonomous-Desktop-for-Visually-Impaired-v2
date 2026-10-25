@@ -313,6 +313,20 @@ class LongTermMemory:
                 """
             )
 
+            # Chats ADVI has messaged (WhatsApp, Telegram) and how a name was misheard,
+            # so "CU" can be recognised as "Siyu" next time.
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_names (
+                    app TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    heard_as TEXT NOT NULL DEFAULT '',
+                    last_used TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (app, name, heard_as)
+                )
+                """
+            )
+
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(memories)").fetchall()}
             rich_columns = {
                 "kind": "TEXT NOT NULL DEFAULT 'fact'",
@@ -815,6 +829,30 @@ class LongTermMemory:
                 )
 
         return contacts
+
+    def remember_chat(self, app: str, name: str, heard_as: str = "") -> None:
+        """Record a chat ADVI messaged; ``heard_as`` is how voice misheard it, if it did."""
+        app, name = app.strip().casefold(), name.strip()
+        heard_as = heard_as.strip().casefold() if heard_as.strip().casefold() != name.casefold() else ""
+        if not app or not name:
+            return
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO chat_names (app, name, heard_as) VALUES (?, ?, ?)
+                ON CONFLICT(app, name, heard_as) DO UPDATE SET last_used = CURRENT_TIMESTAMP
+                """,
+                (app, name, heard_as),
+            )
+
+    def known_chats(self, app: str, limit: int = 200) -> list[tuple[str, str]]:
+        """(name, heard_as) pairs for an app, most recently used first."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT name, heard_as FROM chat_names WHERE app = ? ORDER BY last_used DESC LIMIT ?",
+                (app.strip().casefold(), int(limit)),
+            ).fetchall()
+        return [(row["name"], row["heard_as"]) for row in rows]
 
 
     def save_contact(

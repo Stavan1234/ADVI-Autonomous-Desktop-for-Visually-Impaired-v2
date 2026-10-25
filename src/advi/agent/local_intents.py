@@ -14,10 +14,15 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any
 
+# Voice adds openers and the assistant's name, as Whisper hears it ("Yo, Adhvi, ...",
+# "Well, can you ..."), and stutters ("Play, play song on YouTube"): live log 2026-10-24.
+_NAME = r"(?:advi|adhvi|adwi|atwi|advee|adivi)"
 _POLITE = re.compile(
-    r"^(?:(?:hey\s+|ok(?:ay)?\s+)?advi[,\s]+)?(?:please\s+|can you\s+|could you\s+|would you\s+|will you\s+|i want you to\s+|kindly\s+)*",
+    rf"^(?:(?:hey|hi|yo|ok(?:ay)?|well|so|um+|uh+|alright|right)[,\s]+)*(?:{_NAME}[,.!\s]+)?"
+    r"(?:please\s+|can you\s+|could you\s+|would you\s+|will you\s+|i want you to\s+|kindly\s+)*",
     re.I,
 )
+_STUTTER = re.compile(r"^(\w+)[,.\s]+\1\b", re.I)
 _TRAILING = re.compile(r"[\s.!?]+$|\s+(?:please|for me|now)[\s.!?]*$", re.I)
 
 SITES: dict[str, str] = {
@@ -92,6 +97,7 @@ class LocalIntent:
 def _clean(text: str) -> str:
     value = re.sub(r"\s+", " ", str(text or "")).strip()
     value = _POLITE.sub("", value)
+    value = _STUTTER.sub(r"\1", value)
     return _TRAILING.sub("", value).strip()
 
 
@@ -103,12 +109,18 @@ def _folder(word: str) -> str | None:
     return FOLDERS.get(re.sub(r"\s+folder$", "", word.strip().casefold()).removeprefix("my ").removeprefix("the ").strip())
 
 
-def match_local_intent(text: str) -> LocalIntent | None:
+def match_local_intent(text: str, *, offline: bool = False) -> LocalIntent | None:
+    """A built-in command, or None. ``offline``: the AI is unavailable, so an
+    ambiguous-but-clear message ("send message to X saying Y", no app named) is
+    taken as WhatsApp rather than refused; with the AI up it decides the app."""
     raw = _clean(text)
     if not raw or len(raw) > 400:
         return None
     lower = raw.casefold()
-    for matcher in (_email, _whatsapp, _media_control, _play, _site_search, _open_site, _files, _open_app):
+    matchers = [_answer, _email, _whatsapp, _media_control, _play, _site_search, _open_site, _files, _open_app]
+    if offline:
+        matchers.insert(3, _message_any_app)
+    for matcher in matchers:
         intent = matcher(raw, lower)
         if intent is not None:
             return intent
@@ -151,12 +163,26 @@ def _whatsapp(raw: str, lower: str) -> LocalIntent | None:
         return LocalIntent("telegram", "telegram_send_message", found.arguments, {"app": "telegram"})
     if "whatsapp" not in lower:
         return None
+    # "send message to David saying Hello from advi , on whatsapp." (live log):
+    # the app named at the very end is not part of the message.
+    tail = re.search(r"[\s,]*(?:on|via|in|over|using)\s+whatsapp(?:\s+web)?[\s.!]*$", raw, re.I)
+    if tail:
+        stripped = raw[:tail.start()].rstrip(" ,.")
+        trailing = re.match(
+            r"^(?:open whatsapp(?:\s+web)?\s*(?:,|and)\s*)?(?:send|write)\s+(?:an?\s+)?(?:whatsapp\s+)?(?:message|msg|text)\s+to\s+"
+            r"(?P<chat>.+?)\s*,?\s*(?:saying|that says|:)\s*(?P<text>.+)$",
+            stripped, re.I,
+        )
+        if trailing:
+            chat, message = _unquote(trailing.group("chat")), _unquote(trailing.group("text")).rstrip(" ,")
+            if chat and message:
+                return LocalIntent("whatsapp", "whatsapp_send_message", {"chat": chat, "text": message})
     quoted_chat = re.search(r"\b(?:chat|group|contact)\s+(?:called|named)?\s*[\"“]([^\"”]+)[\"”]", raw, re.I)
     quoted_text = re.search(r"\b(?:message|saying|text|type)\s*(?:box\s+type\s*)?[\"“]([^\"”]+)[\"”]", raw, re.I)
     if quoted_chat and quoted_text:
         return LocalIntent("whatsapp", "whatsapp_send_message", {"chat": quoted_chat.group(1).strip(), "text": quoted_text.group(1).strip()})
     patterns = (
-        r"^(?:open whatsapp(?:\s+web)?\s*(?:,|and)\s*)?send\s+(?:a\s+)?(?:whatsapp\s+)?(?:message|msg|text)?\s*to\s+(?P<chat>.+?)\s+(?:on|via|in|over)\s+whatsapp(?:\s+web)?\s*(?:saying|that says|:)\s*(?P<text>.+)$",
+        r"^(?:open whatsapp(?:\s+web)?\s*(?:,|and)\s*)?send\s+(?:an?\s+)?(?:whatsapp\s+)?(?:message|msg|text)?\s*to\s+(?P<chat>.+?)\s+(?:on|via|in|over)\s+whatsapp(?:\s+web)?\s*,?\s*(?:saying|that says|:)\s*(?P<text>.+)$",
         r"^(?:open whatsapp(?:\s+web)?\s*(?:,|and)\s*)?send\s+(?:a\s+)?whatsapp\s+(?:message|msg|text)?\s*to\s+(?P<chat>.+?)\s*(?:saying|that says|:)\s*(?P<text>.+)$",
         r"^whatsapp\s+(?P<chat>.+?)\s*(?:saying|that says|:)\s*(?P<text>.+)$",
         r"^(?:message|text|tell)\s+(?P<chat>.+?)\s+(?:on|via|in|over)\s+whatsapp\s*(?:saying|that says|that|:)\s*(?P<text>.+)$",
@@ -169,6 +195,42 @@ def _whatsapp(raw: str, lower: str) -> LocalIntent | None:
             chat = re.sub(r"\s+(?:on|via|in)\s+whatsapp(?:\s+web)?$", "", chat, flags=re.I).strip()
             if chat and message and "whatsapp" not in chat.casefold():
                 return LocalIntent("whatsapp", "whatsapp_send_message", {"chat": chat, "text": message})
+    return None
+
+
+def _message_any_app(raw: str, lower: str) -> LocalIntent | None:
+    """'send message to X saying Y' with no app named: WhatsApp, named in the confirmation.
+
+    The confirmation reads "send the WhatsApp message ... to X", so the user can
+    still say "on Telegram" or "no" before anything is sent.
+    """
+    if re.search(r"\b(?:whatsapp|telegram|e-?mail|mail|gmail|sms)\b", lower):
+        return None
+    match = re.match(
+        r"^(?:send|write)\s+(?:an?\s+)?(?:message|msg|text)\s+to\s+(?P<chat>.+?)\s*,?\s*(?:saying|that says|:)\s*(?P<text>.+)$",
+        raw, re.I,
+    )
+    if not match:
+        return None
+    chat, message = _unquote(match.group("chat")), _unquote(match.group("text"))
+    if not chat or not message or len(chat.split()) > 4:
+        return None
+    return LocalIntent("whatsapp", "whatsapp_send_message", {"chat": chat, "text": message}, {"app_assumed": True})
+
+
+# --- answers without any tool ---------------------------------------------------
+
+def _answer(raw: str, lower: str) -> LocalIntent | None:
+    """Time, date and battery: answered on this PC, with or without the AI."""
+    if re.fullmatch(r"(?:what(?:'s| is)? the time|what time is it|tell me the time|time|current time)(?: now| right now)?", lower):
+        return LocalIntent("answer", "", {}, {"what": "time"})
+    if re.fullmatch(r"(?:what(?:'s| is)? (?:the |today's )?date|what day is (?:it|today)|today's date|what is today)(?: today)?", lower):
+        return LocalIntent("answer", "", {}, {"what": "date"})
+    if re.fullmatch(r"(?:what(?:'s| is)? (?:my |the )?battery(?: level| percentage| status)?|how much battery(?: is left| do i have)?|battery(?: level| status)?)", lower):
+        return LocalIntent("answer", "get_battery_status", {}, {"what": "battery"})
+    if re.fullmatch(r"(?:is (?:the |my )?(?:internet|wi-?fi|network) (?:connected|working|on)|am i (?:online|connected)|"
+                    r"(?:do i have|is there) (?:an? )?internet(?: connection)?|internet(?: connection)?(?: status)?)", lower):
+        return LocalIntent("answer", "get_network_status", {}, {"what": "network"})
     return None
 
 
@@ -230,6 +292,15 @@ def _site_key(name: str) -> str | None:
 
 
 def _site_search(raw: str, lower: str) -> LocalIntent | None:
+    # "Search Amazon for a wireless mouse" / "search on Google for X": the site comes
+    # first. It was read as a Google search for "Amazon for a wireless mouse".
+    first = re.match(r"^(?:search|look\s+up|look)\s+(?:on\s+|in\s+)?(?P<site>[a-z ]+?)\s+for\s+(?P<q>.+)$", raw, re.I)
+    if first and _site_key(first.group("site")) in SEARCH_URLS:
+        site = _site_key(first.group("site"))
+        query = _unquote(re.sub(r"^(?:an?|the)\s+", "", first.group("q").strip(), flags=re.I))
+        if query:
+            url = SEARCH_URLS[site].format(q=urllib.parse.quote_plus(query))
+            return LocalIntent("site_search", "navigate", {"url": url}, {"site": site, "query": query})
     match = re.match(r"^(?:search|look up|find)\s+(?:for\s+)?(?P<q>.+?)\s+(?:on|in|at)\s+(?P<site>[a-z ]+?)$", raw, re.I) or re.match(
         r"^(?:search|go to|open)\s+(?P<site>[a-z ]+?)\s+(?:and\s+)?(?:search|look)\s+(?:for\s+)?(?P<q>.+)$", raw, re.I)
     if not match:

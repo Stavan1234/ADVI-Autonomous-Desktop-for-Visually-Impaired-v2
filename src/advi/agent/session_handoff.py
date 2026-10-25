@@ -10,7 +10,11 @@ _MAX_CONVERSATION_MESSAGES = 8
 _MAX_DICT_ITEMS = 16
 _MAX_LIST_ITEMS = 12
 _MAX_STRING_CHARS = 4000
-_MAX_DEPTH = 5
+# A file listing sits six levels deep (exchange > result > output > files > file > name);
+# at 5, every name and size became "[depth limit]" whenever a rate limit moved the chat
+# to another key, and the AI said it couldn't see the files (sweep, 2026-10-25). Size
+# stays bounded by _MAX_HANDOFF_CHARS.
+_MAX_DEPTH = 9
 _MAX_HANDOFF_CHARS = 7000
 
 

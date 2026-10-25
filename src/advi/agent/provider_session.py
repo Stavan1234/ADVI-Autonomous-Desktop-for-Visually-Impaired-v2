@@ -6,7 +6,7 @@ import json
 import time
 import threading
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from zoneinfo import ZoneInfo
 
 from advi.providers.base import LLMProvider, LLMResponse, LLMToolCall, ProviderHealthState
@@ -579,6 +579,57 @@ class ProviderSessionManager:
         self.session: ProviderSession | None = None
         self.switch_count = 0
         self.last_attempts: tuple[ProviderAttempt, ...] = ()
+        # Told how long ADVI is about to wait, so it can say so out loud.
+        self.wait_notice: Callable[[float], None] | None = None
+        self._sleep: Callable[[float], None] = time.sleep
+
+    # A per-minute limit on every key clears within seconds. Telling a blind
+    # user "try again in about 20 seconds" made them repeat themselves; ADVI
+    # now waits that out once (Desktop Suite dev run, 2026-10-23). A daily
+    # quota is never waited for.
+    SHORT_WAIT_MAX_SECONDS = 25.0
+
+    def _short_wait(self, exc: Exception) -> float | None:
+        if not isinstance(exc, LLMRateLimitError):
+            return None
+        message = str(exc).casefold()
+        if getattr(exc, "quota_scope", None) == "project_daily" or "quota-exhausted" in message or "daily" in message or "per day" in message:
+            return None
+        now = time.monotonic()
+        if all(self.health_state.quota_exhausted_until.get(self._group_for(i), 0.0) > now
+               for i in range(len(self.providers))):
+            return None  # every key is out for the day
+        # Wait until the first key is free again, not for the slowest one.
+        cooling = [until - now for until in self.health_state.cooldown_until.values() if until > now]
+        try:
+            wait = min(cooling) if cooling else float(getattr(exc, "retry_after_seconds", None))
+        except (TypeError, ValueError):
+            return None
+        return wait + 0.5 if 0 < wait <= self.SHORT_WAIT_MAX_SECONDS else None
+
+    def _waiting_out_short_limits(self, send: Callable[[], LLMResponse]) -> LLMResponse:
+        try:
+            return send()
+        except LLMRateLimitError as exc:
+            wait = self._short_wait(exc)
+            if wait is None:
+                raise
+            trace("gateway.provider_session.short_limit_wait", seconds=round(wait, 1), error=str(exc))
+            if self.wait_notice is not None:
+                try:
+                    self.wait_notice(wait)
+                except Exception:
+                    pass
+            self._sleep(wait)
+            return send()
+
+    def send_user(self, content: str, **kwargs: Any) -> LLMResponse:
+        """Send a user turn; one short per-minute limit is waited out, not reported."""
+        return self._waiting_out_short_limits(lambda: self._send_user_once(content, **kwargs))
+
+    def send_tool_results(self, results: list[tuple[LLMToolCall, dict[str, Any]]], **kwargs: Any) -> LLMResponse:
+        """Continue a tool round; one short per-minute limit is waited out, not reported."""
+        return self._waiting_out_short_limits(lambda: self._send_tool_results_once(results, **kwargs))
 
     @property
     def active_provider(self) -> LLMProvider:
@@ -773,7 +824,7 @@ class ProviderSessionManager:
         self.tools = list(tools)
         self.native_turns = 0
 
-    def send_user(
+    def _send_user_once(
         self,
         content: str,
         *,
@@ -885,7 +936,7 @@ class ProviderSessionManager:
             self._close_session()
             return False
 
-    def send_tool_results(
+    def _send_tool_results_once(
         self,
         results: list[tuple[LLMToolCall, dict[str, Any]]],
         *,

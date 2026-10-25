@@ -51,6 +51,10 @@ def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip().casefold()
 
 
+def _letters(text: str) -> str:
+    return re.sub(r"[\W_]+", "", str(text or "")).casefold()
+
+
 class WhatsAppSkill:
     def __init__(
         self,
@@ -301,22 +305,45 @@ class WhatsAppSkill:
             )
         row, title = chosen[0]
         evidence["chat_title"] = title
+        before = self._composer(doc)
+        before_name = _norm(before.name) if before is not None else ""
         self.driver.click(row)
 
-        if not self._wait(lambda: self._chat_is_open(doc, title)):
+        if not self._wait(lambda: self._chat_is_open(doc, title, before_name, evidence)):
             composer = self._composer(doc)
             raise StepFailed("chat_opened", f"I clicked '{title}' but couldn't confirm that chat opened.",
                              composer_name=composer.name if composer is not None else None)
         evidence["chat_open_verified"] = True
         return title
 
-    def _chat_is_open(self, doc: UiaNode, title: str) -> bool:
-        """The composer names its chat: "Type a message to [group] <title>"."""
+    def _chat_is_open(self, doc: UiaNode, title: str, before_name: str = "", evidence: dict[str, Any] | None = None) -> bool:
+        """The composer names its chat: "Type a message to [group] <title>".
+
+        A contact not saved on the phone is listed by profile name ("David
+        FCRIT College") but its composer names the number ("Type a message to
+        +91 95944 18687"); the open chat was rejected (live log, 2026-10-21).
+        A switch to a phone-number composer right after clicking that one
+        result row is accepted.
+        """
         composer = self._composer(doc)
         if composer is None:
             return False
-        target = re.sub(r"^type a message to (?:group )?", "", _norm(composer.name))
-        return target == _norm(title)
+        name = _norm(composer.name)
+        target = re.sub(r"^type a message to (?:group )?", "", name)
+        if target == _norm(title):
+            return True
+        # Titles with emoticons or emoji ("Siyu ^_^") are named without them, or with
+        # them spelled differently, by the composer; the opened chat was rejected
+        # (live log 2026-10-24). Compare letters and digits only.
+        bare_target, bare_title = _letters(target), _letters(title)
+        if bare_target and bare_title and name != before_name and (
+                bare_target == bare_title or bare_title.startswith(bare_target) or bare_target.startswith(bare_title)):
+            return True
+        if name != before_name and re.fullmatch(r"\+?[\d\s()-]{7,}", target):
+            if evidence is not None:
+                evidence["chat_number"] = target
+            return True
+        return False
 
     def _compose(self, window: UiaNode, doc: UiaNode, text: str, evidence: dict[str, Any]) -> UiaNode:
         composer = self._wait(lambda: self._composer(doc))
@@ -365,9 +392,16 @@ _STAMP = re.compile(
 )
 
 
+# Chats with unread messages are labelled "2 unread messages Anurodh Yesterday ...":
+# the title did not start with "anurodh", so the chat was reported as not found
+# (live log, 2026-10-21). Unsaved contacts can carry a leading "~".
+_LABEL_PREFIX = re.compile(r"^(?:(?:\d+\s+unread\s+messages?|unread|pinned|muted|archived)\b[\s,.]*|~\s*)+", re.I)
+
+
 def chat_title_from_label(label: str) -> str:
     """Strip the activity stamp and preview: "New Chapter 21/07/2025 You: hi" -> "New Chapter"."""
-    return _STAMP.split(str(label or "").strip(), maxsplit=1)[0].strip()
+    title = _STAMP.split(str(label or "").strip(), maxsplit=1)[0].strip()
+    return _LABEL_PREFIX.sub("", title).strip()
 
 
 def _is_composer_name(name: str) -> bool:

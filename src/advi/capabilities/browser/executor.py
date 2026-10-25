@@ -29,6 +29,21 @@ _CONSEQUENTIAL_CLICK = re.compile(
 )
 
 
+# A *link* labelled "Buy iMac" or "Book now" only opens the shop or booking
+# page; paying is always a later button. Gating it stopped "find the starting
+# price of the cheapest iMac" at the price page's door (WebVoyager dev run,
+# 2026-10-23). Paying, ordering, sending, submitting and deleting stay gated
+# even on links.
+_STILL_CONSEQUENTIAL = re.compile(
+    r"\b(?:pay|payment|place (?:your |the )?order|confirm|transfer|send|donate|submit|delete|remove account|"
+    r"close account|unsubscribe|publish|post)\b"
+)
+
+
+def _browse_only_link(element: dict[str, Any], label: str) -> bool:
+    return element.get("role") == "link" and not _STILL_CONSEQUENTIAL.search(label.casefold())
+
+
 class BrowserCapability:
     """
     Browser Automation Capability.
@@ -62,6 +77,23 @@ class BrowserCapability:
         self.cdp_port = int(cdp_port)
         self.user_data_dir = user_data_dir
         self.cdp = CDPBrowser(port=self.cdp_port)
+
+    def _owned_or_started_tab(self) -> str | None:
+        """ADVI's tab, starting ADVI's Chrome first when none is open yet.
+
+        "play baby shark on youtube" as the first browser request of a run
+        failed with "No ADVI-owned Chrome tab is available" (live log,
+        2026-10-21). Playwright connects to or launches ADVI's Chrome itself.
+        """
+        tab_id = self._owned_tab_id()
+        if tab_id or not self._pw_enabled():
+            return tab_id
+        try:
+            self._pw_ready()
+        except Exception as exc:
+            logger.warning("Could not start ADVI's browser: %s", exc)
+            return None
+        return self._owned_tab_id()
 
     def _owned_tab_id(self) -> str | None:
         """Return ADVI's exact live browser target, never an arbitrary Chrome tab."""
@@ -434,9 +466,9 @@ class BrowserCapability:
                 call_id=action.call_id, name=action.action, success=False,
                 error=f"play_media supports YouTube and YouTube Music, not '{service}'.",
             )
-        tab_id = self._owned_tab_id()
+        tab_id = self._owned_or_started_tab()
         if not tab_id:
-            return ToolResult(call_id=action.call_id, name=action.action, success=False, error="No ADVI-owned Chrome tab is available.")
+            return ToolResult(call_id=action.call_id, name=action.action, success=False, error="No ADVI-owned Chrome tab is available, and I couldn't open ADVI's Chrome window to play that.")
         base = "https://music.youtube.com/search?q=" if music else "https://www.youtube.com/results?search_query="
         url = base + urllib.parse.quote_plus(query)
         navigated = False
@@ -1529,11 +1561,11 @@ class BrowserCapability:
                 name=action.action, success=False, error="No web research query specified."
             )
 
-        tab_id = self._owned_tab_id()
+        tab_id = self._owned_or_started_tab()
         if not tab_id:
             return ToolResult(
                 call_id=action.call_id,
-                name=action.action, success=False, error="No ADVI-owned Chrome tab is available for web research."
+                name=action.action, success=False, error="No ADVI-owned Chrome tab is available for web research, and I couldn't open one."
             )
 
         search_url = f"https://www.google.com/search?q={urllib.parse.quote_plus(query)}"
@@ -1925,22 +1957,59 @@ class BrowserCapability:
             metadata={"tab_id": tab_id, "selector": selector, "before":data.get("before"), "after":data.get("after"), "expected":text, "cdp_port": self.cdp_port},
         )
 
+    # The page's main content as text: search results, product titles and
+    # prices, article body. Header menus come first in document.body and
+    # crowded results out of a 4000-character read.
+    _MAIN_TEXT_SCRIPT = (
+        "(() => { const d = document, el = d.querySelector('main, [role=main], #search, #content') || d.body;"
+        r" return (el ? el.innerText || '' : '').replace(/[ \t]+/g, ' ').replace(/\n\s*\n+/g, '\n').trim().substring(0, 60000); })()"
+    )
+    _READ_CHUNK = 3000
+
+    def _main_text(self, tab_id: str) -> str | None:
+        res = self.cdp.evaluate_script(tab_id, self._MAIN_TEXT_SCRIPT)
+        # CDPBrowser returns the value itself; some test/legacy adapters return {"value": ...}.
+        if isinstance(res, dict) and "value" in res:
+            res = res.get("value", "")
+        return self._distill(res) if isinstance(res, str) else None
+
+    @staticmethod
+    def _distill(text: str) -> str:
+        """Drop repeats and fragments so more of the page fits in one read.
+
+        Amazon's result text repeats each title (full, then cut off with "…")
+        and splits prices into "₹11,990" / "." / "00": 2500 characters covered
+        three products (live probe, 2026-10-23).
+        """
+        kept: list[str] = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or re.fullmatch(r"[\d.,]{1,3}", line):
+                continue
+            recent = kept[-6:]
+            stem = line.rstrip("…").rstrip()
+            if line in recent or (line.endswith("…") and any(r.startswith(stem) for r in recent)):
+                continue
+            if any(r.startswith(line) and r != line for r in recent[-3:]):
+                continue  # "₹11,990" right after "₹11,990.00"
+            kept.append(line)
+        return "\n".join(kept)
+
     def _execute_read_web_page(self, action: ToolCall) -> ToolResult:
         tab_id = self._owned_tab_id()
         if not tab_id:
             return ToolResult(call_id=action.call_id, name=action.action, success=False, error="No ADVI-owned Chrome tab is available.")
 
-        res = self.cdp.evaluate_script(
-            tab_id,
-            "document.body.innerText.substring(0, 4000)",
-        )
-        # CDPBrowser.evaluate_js returns the by-value result directly. Some
-        # lightweight test/legacy adapters return {"value": ...}. Accept both
-        # shapes so the browser capability has one stable contract.
-        if isinstance(res, dict) and "value" in res:
-            text = res.get("value", "")
-        else:
-            text = res if isinstance(res, str) else ""
+        try:
+            start = max(0, int(action.parameters.get("start") or 0))
+        except (TypeError, ValueError):
+            start = 0
+        full = self._main_text(tab_id)
+        res = None if full is None else full[start:start + self._READ_CHUNK]
+        remaining = 0 if full is None else max(0, len(full) - start - self._READ_CHUNK)
+        text = res if isinstance(res, str) else ""
+        if text and remaining:
+            text += f"\n[{remaining} more characters; read_web_page start={start + self._READ_CHUNK} continues]"
         get_tab_info = getattr(self.cdp, "get_tab_info", None)
         info = (get_tab_info(tab_id) if get_tab_info else {}) or {}
         current_url = info.get("url") or self.context.target_tab_url
@@ -2083,6 +2152,17 @@ class BrowserCapability:
 
             limit = max(10, min(int(action.parameters.get("limit") or SNAPSHOT_LIMIT), SNAPSHOT_LIMIT))
             snap = browser.snapshot(limit=limit)
+            if not snap.elements:
+                # Right after a search the page was still rendering: "0
+                # interactive elements", then a stale ref and a repeated
+                # search (WebVoyager dev run, 2026-10-23). Let it settle once.
+                browser.wait_dom_stable(timeout=4.0)
+                snap = browser.snapshot(limit=limit)
+            if not snap.elements:
+                # Heavy pages (Amazon results) were still empty after that; wait for the
+                # network to go quiet and look once more (capability sweep, 2026-10-25).
+                browser.settle(network_ms=5000)
+                snap = browser.snapshot(limit=limit)
         except Exception as exc:
             logger.warning("Playwright snapshot failed, using legacy inventory: %s", exc)
             return self._legacy_inspect_web_page(action)
@@ -2100,8 +2180,10 @@ class BrowserCapability:
             return self._legacy_click_web_element(action)
         try:
             browser, page = self._pw_ready()
-            label = next((str(e.get("name") or "") for e in (browser.latest.elements if browser.latest else []) if e.get("ref") == ref), "")
-            if _CONSEQUENTIAL_CLICK.search(label.casefold()) and not getattr(self, "_approval_granted", False):
+            element = next((e for e in (browser.latest.elements if browser.latest else []) if e.get("ref") == ref), {})
+            label = str(element.get("name") or "")
+            if (_CONSEQUENTIAL_CLICK.search(label.casefold()) and not _browse_only_link(element, label)
+                    and not getattr(self, "_approval_granted", False)):
                 # Buying, paying, sending, submitting or deleting on a website
                 # needs the user's yes first, like email_send and WhatsApp.
                 return ToolResult(
@@ -2175,9 +2257,19 @@ class BrowserCapability:
         changed = bool(submitted.details.get("url_changed") or submitted.details.get("page_changed"))
         summary = (f"Searched for '{query}'; results are showing at {browser.page.url}." if changed
                    else f"Typed '{query}' into the search field and pressed Enter, but the page did not change.")
+        results = ""
+        if changed:
+            # The results as text in the same step, so the brain can answer
+            # ("3 speakers around 20,000 rupees ...") instead of searching again.
+            try:
+                browser.wait_dom_stable(timeout=4.0)
+                results = self._distill(str(browser.page.evaluate(self._MAIN_TEXT_SCRIPT) or ""))[:2500]
+            except Exception as exc:
+                logger.info("Could not read search results text: %s", exc)
         return self._pw_result(
             action, success=filled.ok and changed, summary=summary,
-            output={"result": summary, "url": browser.page.url, "snapshot": submitted.details.get("snapshot")},
+            output={"result": summary, "url": browser.page.url, "results": results,
+                    "snapshot": None if results else submitted.details.get("snapshot")},
             details={"method": "playwright_site_search", "field": fields[0].get("name"), "before_url": before_url,
                      "current_url": browser.page.url},
             metadata={"query": query},
@@ -2276,9 +2368,16 @@ class BrowserCapability:
                     except Exception:
                         continue
                 if found:
-                    time.sleep(0.6)
-                    playing = bool(browser.media_state().get("playing"))
-                    ok = (not playing) if op == "pause" else playing
+                    # play() is asynchronous: one check at 0.6 s reported "not
+                    # playing" for a song that started a moment later, and the
+                    # brain then pressed space and paused it (log, 2026-10-23).
+                    deadline = time.monotonic() + 3.0
+                    while True:
+                        time.sleep(0.3)
+                        playing = bool(browser.media_state().get("playing"))
+                        ok = (not playing) if op == "pause" else playing
+                        if ok or time.monotonic() >= deadline:
+                            break
                     word = "Paused" if op == "pause" else "Resumed"
                     return ToolResult(
                         call_id=action.call_id, name=action.action, success=ok,
@@ -2296,11 +2395,15 @@ class BrowserCapability:
         for _ in range(5 if op in {"volume_up", "volume_down"} else 1):
             user32.keybd_event(key, 0, 0, 0)
             user32.keybd_event(key, 0, 2, 0)
-        word = {"pause": "Paused", "resume": "Resumed", "toggle": "Toggled playback", "next": "Skipped to the next track",
+        word = {"pause": "Pressed play/pause on your media player", "resume": "Pressed play/pause on your media player",
+                "toggle": "Pressed play/pause on your media player", "next": "Skipped to the next track",
                 "previous": "Went back a track", "volume_up": "Turned the volume up", "volume_down": "Turned the volume down",
                 "mute": "Toggled mute"}[op]
+        # Windows handles media keys itself; what ADVI can confirm is that the key
+        # was sent. Reporting this as unverified made every "volume up" end with
+        # "I couldn't verify the final state" (log, 2026-10-23).
         return ToolResult(
             call_id=action.call_id, name=action.action, success=True,
-            human_readable=f"{word} with the media key.", verified=False, verification_status="uncertain",
-            verification_details={"method": "windows_media_key", "key": hex(key)},
+            human_readable=f"{word}.", verified=True, verification_status="verified",
+            verification_details={"method": "windows_media_key", "key": hex(key), "evidence": "key_sent_only"},
         )

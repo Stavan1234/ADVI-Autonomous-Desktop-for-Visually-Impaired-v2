@@ -441,7 +441,7 @@ class CDPBrowser:
             search_info = result.value
 
         if not search_info:
-            logger.warning("Could not find in-site search input element on tab %s.", tab_id)
+            logger.info("Could not find in-site search input element on tab %s.", tab_id)
             return False
 
         js_type_and_submit = f"""

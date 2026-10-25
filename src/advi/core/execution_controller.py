@@ -135,7 +135,20 @@ class ExecutionController:
             return None
 
         target = matches[0]
-        wants_folder = bool(re.search(r"\b(?:folder|directory)\b", goal, re.I))
+        # "Open largefile.txt in <folder>, count 'example' and save the number": opening
+        # is not the task, and the found item is a file even though "folder" appears.
+        # The controller opened it as a folder, failed, and the task ended FAILED
+        # (Desktop Suite regression, 2026-10-24). Only a plain open/read continues here.
+        if re.search(r"\b(?:count|save|write|type|copy|move|delete|rename|summari[sz]e|send|edit|replace|append|create)\b", goal, re.I):
+            return None
+        try:
+            from pathlib import Path
+
+            found = Path(target)
+            is_dir = found.is_dir() or (not found.exists() and not found.suffix)
+        except OSError:
+            is_dir = False
+        wants_folder = bool(re.search(r"\b(?:folder|directory)\b", goal, re.I)) and is_dir
         if self._OPEN_INTENT_RE.search(goal) and wants_folder and "open_folder" in available:
             return LocalContinuation(
                 call=ToolCall(

@@ -67,6 +67,29 @@ class ScreenPerception:
             }
         return reader(application=application)
 
+    def window_image(self, application: str | None = None, *, settle: bool = True) -> dict[str, Any]:
+        """A settled in-memory image of a window (foreground without a hint), or the full screen."""
+        from .screen_describer import wait_for_stable_frame
+
+        vision = self.vision
+        if settle:
+            image, settled = wait_for_stable_frame(vision.grab)
+        else:
+            image, settled = vision.grab(), True
+        if application == "full_screen":
+            window_info = None
+            # Still name the window in front, so vision doesn't have to guess the app.
+            front = vision.window_for(None)
+        else:
+            window_info = front = vision.window_for(application)
+        cropped, _origin, scope = vision.crop_to_window(image, window_info)
+        return {
+            "image": cropped,
+            "settled": settled,
+            "scope": scope,
+            "window": (front or {}).get("title"),
+        }
+
     def find(
         self,
         target: str,

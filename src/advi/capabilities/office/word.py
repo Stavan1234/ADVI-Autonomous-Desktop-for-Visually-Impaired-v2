@@ -71,12 +71,19 @@ def parse_blocks(content: str, title: str = "") -> list[Block]:
             blocks.append(Block("table", rows=[row[:] for row in table]))
             table.clear()
 
-    for raw in str(content or "").replace("\r\n", "\n").split("\n"):
+    lines = str(content or "").replace("\r\n", "\n").split("\n")
+    separator = re.compile(r"^\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?$")
+    for index, raw in enumerate(lines):
         line = raw.strip()
-        if line.startswith("|") and line.endswith("|") and line.count("|") >= 3:
-            cells = [c.strip() for c in line.strip("|").split("|")]
-            if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
+        # A one-column table ("| Month |", 2 pipes) was written out as literal pipes
+        # (live log 2026-10-24: "it created a very poor table, like markdown").
+        # Rows without outer pipes count when a |---| separator is next to them.
+        bordered = line.startswith("|") and line.endswith("|") and line.count("|") >= 2
+        near_separator = any(separator.match(lines[j].strip()) for j in (index - 1, index + 1) if 0 <= j < len(lines))
+        if bordered or (table and "|" in line) or ("|" in line and near_separator):
+            if separator.match(line):
                 continue  # |---|---| separator
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
             table.append(cells)
             continue
         flush_table()
@@ -246,4 +253,5 @@ def read_back(path: Path) -> dict[str, Any]:
     for table in document.tables:
         for row in table.rows:
             text += "\n" + " | ".join(c.text for c in row.cells)
-    return {"ok": bool(text.strip()), "text": text, "words": len(text.split()), "bytes": len(data)}
+    return {"ok": bool(text.strip()), "text": text, "words": len(text.split()), "bytes": len(data),
+            "tables": len(document.tables), "literal_pipes": sum(1 for p in document.paragraphs if p.text.strip().startswith("|"))}

@@ -14,8 +14,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from advi.core import cancel
 from advi.tools.contracts import ToolCall, ToolResult
 from advi.environment import get_environment_paths
+
+# Folders a computer-wide search skips: Windows, programs, app data and build caches.
+_WALK_SKIP = {
+    "windows", "program files", "program files (x86)", "programdata", "appdata", "system volume information",
+    "recovery", "perflogs", "msocache", "node_modules", "site-packages", "__pycache__", "venv", "env",
+}
 from advi.core.ocr import ocr_text_from_image
 
 logger = logging.getLogger(__name__)
@@ -45,12 +52,15 @@ class FileCapability:
         "read_file",
         "delete_file",
         "copy_file",
+        "zip_files",
+        "set_file_hidden",
         "move_file",
         "rename_file",
         "copy_folder",
         "move_folder",
         "rename_folder",
         "delete_folder",
+        "remove_empty_folders",
         "list_files",
         "find_file",
         "search_file_content",
@@ -404,12 +414,12 @@ class FileCapability:
 
         if suffix == ".xlsx":
             from openpyxl import Workbook
-            import csv
-            from io import StringIO
+            from openpyxl.styles import Font, PatternFill
+            from openpyxl.utils import get_column_letter
             workbook = Workbook()
             sheet = workbook.active
             if content:
-                rows = list(csv.reader(StringIO(content)))
+                rows = FileCapability._table_rows(content)
                 for row in rows:
                     converted = []
                     for value in row:
@@ -424,6 +434,15 @@ class FileCapability:
                         except (TypeError, ValueError):
                             converted.append(value)
                     sheet.append(converted)
+                if rows and len(rows) > 1:
+                    # A real header: bold on a soft fill, frozen, with readable column widths.
+                    for cell in sheet[1]:
+                        cell.font = Font(bold=True)
+                        cell.fill = PatternFill("solid", fgColor="DDEBF7")
+                    sheet.freeze_panes = "A2"
+                for index, column in enumerate(sheet.columns, start=1):
+                    width = max((len(str(c.value)) for c in column if c.value is not None), default=8)
+                    sheet.column_dimensions[get_column_letter(index)].width = min(60, max(10, width + 2))
             workbook.save(path)
             return True, "openpyxl"
 
@@ -1054,6 +1073,83 @@ class FileCapability:
                           verification_details={"source": str(source), "destination": str(destination), "exists": exists},
                           metadata={"source": str(source), "destination": str(destination), "size_bytes": destination.stat().st_size if exists else None})
 
+    def _execute_set_file_hidden(self, action: ToolCall, *, approval_granted: bool = False) -> ToolResult:
+        """Hide or unhide a file or folder (the Windows "Hidden" attribute), verified by reading it back."""
+        raw = action.parameters.get("path") or action.parameters.get("file") or ""
+        hidden = action.parameters.get("hidden")
+        hidden = True if hidden is None else str(hidden).strip().casefold() not in {"false", "0", "no", "off"}
+        target = self.resolve_path(str(raw))
+        if not raw or not target.exists():
+            return ToolResult(call_id=action.call_id, name=action.action, success=False, error=f"Not found: {target}")
+        if os.name != "nt":
+            return ToolResult(call_id=action.call_id, name=action.action, success=False, error="Hiding files is only supported on Windows.")
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        attrs = kernel32.GetFileAttributesW(str(target))
+        if attrs == -1 or attrs == 0xFFFFFFFF:
+            return ToolResult(call_id=action.call_id, name=action.action, success=False, error=f"Can't read the attributes of {target}")
+        wanted = (attrs | 0x2) if hidden else (attrs & ~0x2)
+        if wanted != attrs and not kernel32.SetFileAttributesW(str(target), wanted):
+            return ToolResult(call_id=action.call_id, name=action.action, success=False,
+                              error=f"Windows refused to change {target.name} (error {ctypes.get_last_error()}).")
+        now = kernel32.GetFileAttributesW(str(target))
+        verified = now not in (-1, 0xFFFFFFFF) and bool(now & 0x2) == hidden
+        word = "hidden" if hidden else "visible"
+        return ToolResult(call_id=action.call_id, name=action.action, success=verified, output=str(target),
+                          human_readable=f"{target.name} is now {word}.", verified=verified,
+                          verification_status="verified" if verified else "failed",
+                          verification_details={"method": "file_attributes", "hidden": bool(now & 0x2)})
+
+    def _execute_zip_files(self, action: ToolCall, *, approval_granted: bool = False) -> ToolResult:
+        """Put a folder's files (or the listed files) into a new .zip archive.
+
+        A Desktop Suite dev task (adapted from Windows Agent Arena) asked for
+        "a zip archive named DownloadsBackup.zip from all files in Downloads";
+        ADVI had no way to make one. The archive is verified by reading it back.
+        """
+        import zipfile
+
+        source_str = action.parameters.get("source") or action.parameters.get("folder") or action.parameters.get("path") or ""
+        files_param = action.parameters.get("files") or []
+        destination_str = action.parameters.get("destination") or action.parameters.get("zip") or action.parameters.get("to") or ""
+        if not destination_str or (not source_str and not files_param):
+            return ToolResult(call_id=action.call_id, name=action.action, success=False,
+                              error="Zipping needs the folder (or files) and the name of the .zip to create.")
+        destination = self.resolve_path(str(destination_str))
+        if destination.suffix.lower() != ".zip":
+            destination = destination.with_name(destination.name + ".zip")
+        if files_param:
+            base = self.resolve_path(str(source_str)) if source_str else None
+            items = [self.resolve_path(str(base / f) if base and not Path(str(f)).is_absolute() else str(f)) for f in files_param]
+            folder = base
+        else:
+            folder = self.resolve_path(str(source_str))
+            if not folder.is_dir():
+                return ToolResult(call_id=action.call_id, name=action.action, success=False, error=f"Folder not found: {folder}")
+            items = sorted(p for p in folder.rglob("*") if p.is_file() and p != destination)
+        missing = [str(p) for p in items if not p.is_file()]
+        if missing or not items:
+            return ToolResult(call_id=action.call_id, name=action.action, success=False,
+                              error=f"Nothing to zip; not found: {missing[:5]}" if missing else "The folder has no files to zip.")
+        blocked = self._check_write_path(action, destination, operation="create", approval_granted=approval_granted)
+        if blocked is not None:
+            return blocked
+        if destination.exists():
+            return ToolResult(call_id=action.call_id, name=action.action, success=False, error=f"Destination already exists: {destination}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for item in items:
+                arcname = item.relative_to(folder) if folder is not None and item.is_relative_to(folder) else Path(item.name)
+                archive.write(item, str(arcname))
+        with zipfile.ZipFile(destination) as archive:
+            stored = archive.namelist()
+            intact = archive.testzip() is None
+        verified = intact and len(stored) == len(items)
+        return ToolResult(call_id=action.call_id, name=action.action, success=verified, output=str(destination),
+                          human_readable=f"Created {destination.name} with {len(stored)} file(s) in {destination.parent}.",
+                          verified=verified, verification_status="verified" if verified else "failed",
+                          verification_details={"method": "zip_read_back", "files": len(stored), "intact": intact},
+                          metadata={"destination": str(destination), "files": stored[:50]})
+
     def _execute_move_file(self, action: ToolCall, *, approval_granted: bool = False) -> ToolResult:
         source_str = action.parameters.get("source") or action.parameters.get("from") or action.parameters.get("path") or ""
         destination_str = action.parameters.get("destination") or action.parameters.get("to") or action.parameters.get("target") or ""
@@ -1212,6 +1308,51 @@ class FileCapability:
                           verified=gone, verification_status="verified" if gone else "uncertain",
                           verification_details={"path": str(target), "exists": target.exists(), "recursive": recursive},
                           metadata={"path": str(target), "recursive": recursive})
+
+    def _execute_remove_empty_folders(self, action: ToolCall, *, approval_granted: bool = False) -> ToolResult:
+        """Move every empty subfolder of a folder to the Recycle Bin, as one verified step.
+
+        The model was given each folder's "empty" flag and still answered "I can't see
+        which folders are empty" (Desktop Suite regression, 2026-10-24). Checking for
+        emptiness is the computer's job, not the AI's.
+        """
+        path_str = action.parameters.get("path") or action.parameters.get("directory") or action.parameters.get("folder") or action.target or ""
+        if not path_str:
+            return ToolResult(call_id=action.call_id, name=action.action, success=False, error="No folder path provided.")
+        target = self.resolve_path(str(path_str))
+        if not target.is_dir():
+            return ToolResult(call_id=action.call_id, name=action.action, success=False, error=f"Folder not found: {target}")
+        blocked = self._check_write_path(action, target, operation="delete folder", approval_granted=approval_granted)
+        if blocked is not None:
+            return blocked
+        recursive = bool(action.parameters.get("recursive", False))
+        # Deepest first, so a folder holding only empty folders empties out too when recursive.
+        candidates = sorted((p for p in (target.rglob("*") if recursive else target.iterdir()) if p.is_dir()),
+                            key=lambda p: len(p.parts), reverse=True)
+        removed, problems = [], []
+        for folder in candidates:
+            try:
+                if any(folder.iterdir()):
+                    continue
+            except OSError:
+                continue
+            recycled, problem = self._trash(folder)
+            if recycled and not folder.exists():
+                removed.append(folder.name)
+            else:
+                problems.append(f"{folder.name}: {problem or 'still there'}")
+        names = ", ".join(removed)
+        human = (f"Moved {len(removed)} empty folder{'s' if len(removed) != 1 else ''} to the Recycle Bin: {names}."
+                 if removed else f"There were no empty folders in '{target.name}'.")
+        if problems:
+            human += f" Couldn't remove: {'; '.join(problems)}."
+        return ToolResult(
+            call_id=action.call_id, name=action.action, success=not problems, output={"removed": removed, "problems": problems},
+            human_readable=human, error="; ".join(problems) or None, verified=True,
+            verification_status="verified" if not problems else "failed",
+            verification_details={"method": "folder_absence", "removed": removed, "recursive": recursive},
+            metadata={"path": str(target), "removed": removed},
+        )
 
     def _execute_create_folder(self, action: ToolCall, *, approval_granted: bool = False) -> ToolResult:
         path_str = action.parameters.get("path") or action.parameters.get("directory") or action.parameters.get("folder") or action.target or ""
@@ -1378,6 +1519,70 @@ class FileCapability:
                 except Exception:
                     pass
         return hwnd, title, process_name, focused
+
+    _MEDIA_PLAYERS = {
+        "microsoft.media.player.exe", "video.ui.exe", "wmplayer.exe", "vlc.exe", "mpc-hc64.exe", "mpc-hc.exe",
+        "potplayermini64.exe", "potplayer.exe", "groove.exe", "music.ui.exe", "mpv.exe", "kmplayer.exe",
+    }
+
+    @staticmethod
+    def _table_rows(content: str) -> list[list[str]]:
+        """Rows from CSV, tab-separated text or a Markdown table (the AI sends all three).
+
+        A Markdown table written as CSV put "| Item | Cost |" into single cells.
+        """
+        import csv
+        from io import StringIO
+
+        lines = [line for line in str(content).replace("\r\n", "\n").split("\n") if line.strip()]
+        if lines and sum(1 for line in lines if line.count("|") >= 2) >= max(1, len(lines) // 2):
+            rows = []
+            for line in lines:
+                if "|" not in line:
+                    continue
+                cells = [c.strip() for c in line.strip().strip("|").split("|")]
+                if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
+                    continue  # |---|---|
+                rows.append(cells)
+            return rows
+        if lines and all("\t" in line for line in lines):
+            return [[c.strip() for c in line.split("\t")] for line in lines]
+        return [row for row in csv.reader(StringIO(content)) if any(cell.strip() for cell in row)]
+
+    def _media_player_started_since(self, since: float, timeout: float = 3.0) -> str | None:
+        """A media player process created after ``since`` (epoch seconds), polled briefly."""
+        import psutil
+
+        deadline = time.monotonic() + timeout
+        while True:
+            for process in psutil.process_iter(["name", "create_time"]):
+                name = str(process.info.get("name") or "")
+                if name.casefold() in self._MEDIA_PLAYERS and float(process.info.get("create_time") or 0) >= since:
+                    return name
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.25)
+
+    def _foreground_media_player(self, timeout: float = 3.0) -> str | None:
+        """The media player in front of the user (polled briefly while it starts), or None."""
+        if os.name != "nt":
+            return None
+        import psutil
+
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                hwnd = ctypes.windll.user32.GetForegroundWindow()
+                pid = ctypes.c_ulong()
+                ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                name = psutil.Process(pid.value).name()
+                if name.casefold() in self._MEDIA_PLAYERS:
+                    return name
+            except Exception:
+                pass
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.25)
 
     def _execute_open_file(self, action: ToolCall, *, approval_granted: bool = False) -> ToolResult:
         path_str = action.parameters.get("path") or action.parameters.get("filename") or action.target or ""
@@ -1604,7 +1809,7 @@ class FileCapability:
                 continue
             try:
                 for current_root, dirs, files in os.walk(root, topdown=True, followlinks=False):
-                    if time.monotonic() >= deadline:
+                    if time.monotonic() >= deadline or cancel.requested():
                         break
                     dirs[:] = [d for d in dirs if d not in {"$Recycle.Bin", "System Volume Information"}]
 
@@ -1766,6 +1971,12 @@ class FileCapability:
         query_fold = query.casefold()
         files_scanned = 0
         unreadable = 0
+        # One file: count every line and occurrence, not just the listed ones.
+        # Listing stopped at 20 lines and the summary said "Found 20", so ADVI
+        # wrote 20 where the word appeared 37 times (Desktop Suite dev run).
+        single_file = len(roots) == 1 and roots[0].is_file()
+        total_lines = occurrences = 0
+        stopped_at_limit = False
 
         for candidate in iter_candidates():
             if time.monotonic() >= deadline or len(matches) >= limit:
@@ -1780,6 +1991,13 @@ class FileCapability:
                 for line_number, line in enumerate(text.splitlines(), start=1):
                     if query_fold not in line.casefold():
                         continue
+                    total_lines += 1
+                    occurrences += line.casefold().count(query_fold)
+                    if len(matches) >= limit:
+                        stopped_at_limit = True
+                        if single_file:
+                            continue
+                        break
                     index = line.casefold().find(query_fold)
                     start = max(0, index - 100)
                     excerpt = line[start:start + 320]
@@ -1794,17 +2012,20 @@ class FileCapability:
                         "excerpt": excerpt,
                         "parser": parser,
                     })
-                    if len(matches) >= limit:
-                        break
             except (OSError, PermissionError, RuntimeError) as exc:
                 unreadable += 1
                 logger.debug("Content search skipped %s: %s", candidate, exc)
 
         timed_out = time.monotonic() >= deadline
-        summary = (
-            f"Found {len(matches)} matching line(s) for '{query}'."
-            if matches else f"Searched {files_scanned} file(s) for '{query}' and found no matches."
-        )
+        if single_file and matches:
+            summary = (f"'{query}' appears {occurrences} time(s) on {total_lines} line(s) of {roots[0].name}"
+                       + (f"; showing the first {len(matches)} lines." if stopped_at_limit else "."))
+        elif matches:
+            summary = f"Found {len(matches)} matching line(s) for '{query}'."
+            if stopped_at_limit:
+                summary += f" I stopped at {limit}; there are more matches."
+        else:
+            summary = f"Searched {files_scanned} file(s) for '{query}' and found no matches."
         if timed_out:
             summary += " The search reached its time limit, so more results may exist."
         return ToolResult(
@@ -1816,6 +2037,8 @@ class FileCapability:
                 "method": "content_search", "query": query, "path": str(roots[0]) if len(roots) == 1 else None, "scope": scope,
                 "count": len(matches), "files_scanned": files_scanned,
                 "unreadable_files": unreadable, "timed_out": timed_out,
+                "stopped_at_limit": stopped_at_limit,
+                **({"occurrences": occurrences, "matching_lines": total_lines} if single_file else {}),
             },
             metadata={
                 "query": query, "path": str(roots[0]) if len(roots) == 1 else None, "scope": scope, "count": len(matches),
@@ -1852,6 +2075,16 @@ class FileCapability:
     @staticmethod
     def _list_entry(path: Path, name: str, *, include_metadata: bool) -> dict[str, Any]:
         item: dict[str, Any] = {"name": name, "path": str(path)}
+        if path.is_dir():
+            # "Remove all empty folders" got "I can't tell which folders are
+            # empty" because listings never said (Desktop Suite, 2026-10-23).
+            try:
+                with os.scandir(path) as entries:
+                    count = sum(1 for _ in entries)
+                item["items"] = count
+                item["empty"] = count == 0
+            except OSError:
+                pass
         if include_metadata:
             try:
                 stat = path.stat()
@@ -1973,30 +2206,64 @@ class FileCapability:
                     roots = [Path("/")]
                 files: list[dict[str, str]] = []
                 folders: list[dict[str, str]] = []
-                for root in roots:
-                    try:
-                        iterator = root.rglob("*") if recursive else root.iterdir()
-                        for entry in iterator:
-                            if entry.is_file():
-                                if extension and entry.suffix.casefold() != extension:
+                stopped = ""
+                if recursive:
+                    # The user's own folders first, then the rest of each drive, skipping
+                    # Windows, program and app-data folders, within 20 seconds and stoppable.
+                    # "Are there any video files on my laptop" walked AppData for 4 minutes
+                    # (live log 2026-10-24) while "stop" could not interrupt it.
+                    home = paths.user_home
+                    personal = [p for p in (paths.desktop, paths.documents, paths.downloads, home / "Videos",
+                                            home / "Music", home / "Pictures", home / "OneDrive") if p.is_dir()]
+                    walk_roots = personal + [r for r in roots if r not in personal]
+                    seen_dirs: set[str] = set()
+                    deadline = time.monotonic() + 20.0
+                    for root in walk_roots:
+                        for current, dirs, names in os.walk(root, topdown=True, onerror=lambda _e: None):
+                            key = os.path.normcase(current)
+                            if key in seen_dirs:
+                                dirs[:] = []
+                                continue
+                            seen_dirs.add(key)
+                            dirs[:] = [d for d in dirs if d.casefold() not in _WALK_SKIP and not d.startswith((".", "$"))]
+                            if cancel.requested():
+                                stopped = "stopped"
+                                break
+                            if time.monotonic() > deadline:
+                                stopped = "time"
+                                break
+                            for filename in names:
+                                if extension and not filename.casefold().endswith(extension):
                                     continue
-                                files.append(self._list_entry(entry, entry.name, include_metadata=include_metadata))
+                                files.append(self._list_entry(Path(current) / filename, filename, include_metadata=include_metadata))
+                            if len(files) >= scan_limit:
+                                break
+                        if stopped or len(files) >= scan_limit:
+                            break
+                else:
+                    for root in roots:
+                        try:
+                            for entry in root.iterdir():
+                                if entry.is_file():
+                                    if extension and entry.suffix.casefold() != extension:
+                                        continue
+                                    files.append(self._list_entry(entry, entry.name, include_metadata=include_metadata))
+                                elif entry.is_dir() and not extension:
+                                    folders.append(self._list_entry(entry, entry.name, include_metadata=include_metadata))
                                 if len(files) + len(folders) >= scan_limit:
                                     break
-                            elif entry.is_dir() and not extension and not recursive:
-                                folders.append(self._list_entry(entry, entry.name, include_metadata=include_metadata))
-                                if len(files) + len(folders) >= scan_limit:
-                                    break
-                    except (OSError, PermissionError):
-                        continue
-                    if len(files) + len(folders) >= scan_limit:
-                        break
+                        except (OSError, PermissionError):
+                            continue
+                        if len(files) + len(folders) >= scan_limit:
+                            break
                 files, folders, truncated = self._finalize_listing(files, folders, limit=limit, sort_by=sort_by, descending=descending)
                 count = len(files) + len(folders)
+                note = {"time": " I stopped searching after 20 seconds, so there may be more.",
+                        "stopped": " I stopped searching because you asked me to."}.get(stopped, "")
                 return ToolResult(
                     call_id=action.call_id, name=action.action, success=True,
-                    output={"directory":"computer","files":files,"folders":folders,"truncated":truncated,"extension":extension or None,"recursive":recursive,"scope":"computer","limit":limit},
-                    human_readable=f"Found {len(files)} files and {len(folders)} folders on this computer" + (f" matching {extension} files." if extension else "."),
+                    output={"directory":"computer","files":files,"folders":folders,"truncated":truncated or bool(stopped),"extension":extension or None,"recursive":recursive,"scope":"computer","limit":limit,"stopped_early":stopped or None},
+                    human_readable=f"Found {len(files)} files and {len(folders)} folders on this computer" + (f" matching {extension} files." if extension else ".") + note,
                     verified=True, verification_status="verified",
                     verification_details={"method":"computer_filesystem_listing","scope":"computer","file_count":len(files),"directory_count":len(folders),"extension":extension or None,"recursive":recursive,"limit":limit},
                     metadata={"scope":"computer","count":count,"file_count":len(files),"directory_count":len(folders),"extension":extension or None,"recursive":recursive,"sort_by":sort_by,"descending":descending,"include_metadata":include_metadata,"limit":limit},
@@ -2005,8 +2272,12 @@ class FileCapability:
                 dir_path = self.desktop_dir
         elif dir_str:
             # Common natural aliases like "the Downloads folder" are normalized locally.
-            dir_clean = re.sub(r"(?i)\b(the|my|folder|directory)\b", " ", dir_str).strip()
-            dir_path = self.resolve_path(dir_clean)
+            # Only standalone words: "\b" also split "waa-move-folder" into
+            # "waa-move- " and the folder was "not found" (Desktop Suite run).
+            dir_path = self.resolve_path(dir_str)
+            if not dir_path.exists():
+                dir_clean = re.sub(r"(?i)(?<![\w-])(the|my|folder|directory)(?![\w-])", " ", dir_str)
+                dir_path = self.resolve_path(re.sub(r"\s{2,}", " ", dir_clean).strip())
         else:
             dir_path = self.desktop_dir
 
@@ -2148,7 +2419,21 @@ class FileCapability:
         is verified by open_file.
         """
         query = str(action.parameters.get("query") or action.parameters.get("name") or "").strip()
-        words = [w for w in re.findall(r"\w+", query.casefold()) if len(w) > 1]
+        folder = str(action.parameters.get("folder") or "").strip()
+        # An exact file ("tone.wav" in the folder the user named) is played as it is.
+        for candidate in ([self.resolve_path(folder) / query] if folder and query else []) + ([self.resolve_path(query)] if query else []):
+            try:
+                if candidate.is_file() and candidate.suffix.lstrip(".").casefold() in self._MEDIA_EXTENSIONS:
+                    return self._play_media_file(action, candidate, match=1.0, alternatives=[])
+            except OSError:
+                continue
+        # "tone.wav" must match the file tone.wav: the extension is not a title word
+        # (it searched for "wav" in the name and found nothing, sweep 2026-10-25).
+        # Generic words aren't title words either: "video clip" must find clip.mp4 (sweep, 2026-10-25).
+        generic = {"video", "videos", "song", "songs", "audio", "music", "file", "track", "movie", "clip_file",
+                   "the", "my", "a", "an", "from", "in", "on", "play", "please", "named", "called"}
+        words = [w for w in re.findall(r"\w+", query.casefold())
+                 if len(w) > 1 and w not in self._MEDIA_EXTENSIONS and w not in generic]
         if not words:
             return ToolResult(call_id=action.call_id, name=action.action, success=False, error="What should I play? No title was given.")
         paths = get_environment_paths()
@@ -2157,7 +2442,6 @@ class FileCapability:
             self._known_folder("4BD8D571-6D19-48D3-BE97-422220080E43", Path(paths.user_home) / "Music"),
             Path(paths.downloads), Path(paths.desktop),
         ]
-        folder = str(action.parameters.get("folder") or "").strip()
         if folder:
             roots.insert(0, self.resolve_path(folder))
         deadline = time.monotonic() + 6.0
@@ -2187,15 +2471,32 @@ class FileCapability:
                 verification_details={"method": "local_media_search", "found": 0},
             )
         scored.sort(key=lambda item: (-item[0], item[1]))
-        chosen = scored[0][2]
+        return self._play_media_file(action, scored[0][2], match=scored[0][0],
+                                     alternatives=[p.name for _s, _l, p in scored[1:4]])
+
+    def _play_media_file(self, action: ToolCall, chosen: Path, *, match: float, alternatives: list[str]) -> ToolResult:
+        started = time.time()
         opened = self._execute_open_file(ToolCall(call_id=f"{action.call_id}-open", name="open_file", arguments={"path": str(chosen)}))
+        if not opened.success:
+            # Windows Media Player's window is titled "Media Player", not the file
+            # name, so the file-window check missed a video that was playing
+            # (live log 2026-10-24). A media player in front, or one that started
+            # just now (it may open behind other windows), is the evidence.
+            player_name = self._foreground_media_player() or self._media_player_started_since(started - 2)
+            if player_name:
+                opened = ToolResult(
+                    call_id=opened.call_id, name=opened.name, success=True, output=opened.output,
+                    verified=True, verification_status="verified",
+                    verification_details={**dict(opened.verification_details or {}), "method": "media_player_foreground", "process": player_name},
+                    metadata={**dict(opened.metadata or {}), "process": player_name},
+                )
         player = (opened.metadata or {}).get("process") or "the default player"
         summary = f"Playing '{chosen.name}' in {player}." if opened.success else f"I found '{chosen.name}' but couldn't confirm the player opened."
         return ToolResult(
             call_id=action.call_id, name=action.action, success=opened.success, output=str(chosen),
             human_readable=summary, error=None if opened.success else summary,
             verified=opened.verified, verification_status=opened.verification_status,
-            verification_details={"method": "local_media_open", "path": str(chosen), "match": round(scored[0][0], 2),
-                                  "alternatives": [p.name for _s, _l, p in scored[1:4]], **dict(opened.verification_details or {})},
+            verification_details={"method": "local_media_open", "path": str(chosen), "match": round(match, 2),
+                                  "alternatives": alternatives, **dict(opened.verification_details or {})},
             metadata={"path": str(chosen), "resolved_path": str(chosen), **dict(opened.metadata or {})},
         )

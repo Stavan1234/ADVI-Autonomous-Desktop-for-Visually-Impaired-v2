@@ -27,11 +27,20 @@ EXCLUDED_FILES = {".env", "mcp_servers.json"}
 EXCLUDED_TOP_LEVEL = {OUTPUT.name}
 EXCLUDED_SUFFIXES = {".pyc", ".pyo"}
 EXCLUDED_SECRETS_DIRS = {"credentials", "secrets"}
+# Large downloads and private data, kept out as in .gitignore: speech models (fetched on
+# first start), raw benchmark runs (screenshots and records of the developer's own
+# mail and files), and reference PDFs / input archives at the project root.
+EXCLUDED_PATHS = {("assets", "whisper"), ("assets", "piper"), ("assets", "models"), ("benchmarks", "results")}
+EXCLUDED_ROOT_SUFFIXES = {".pdf", ".zip"}
 
 
 def excluded(path: Path) -> bool:
     rel = path.relative_to(ROOT)
     parts = rel.parts
+    if tuple(parts[:2]) in EXCLUDED_PATHS:
+        return True
+    if len(parts) == 1 and path.suffix.lower() in EXCLUDED_ROOT_SUFFIXES:
+        return True
     if any(
         part in EXCLUDED_DIRS
         or part in EXCLUDED_SECRETS_DIRS
